@@ -6,6 +6,10 @@ ntfy:
   topic: "lightning-payments"
   token: ""
 
+# Required with withdraw vouchers. Generate with: openssl rand -hex 32
+# Changing it changes every voucher URL.
+withdraw_secret: ""
+
 withdraw:
   - id: "tip-001"
     domain: "tips.yourdomain.com"

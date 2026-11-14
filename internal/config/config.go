@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -10,10 +11,11 @@ import (
 )
 
 type Config struct {
-	LND       LNDConfig               `yaml:"lnd"`
-	Ntfy      *NtfyConfig             `yaml:"ntfy,omitempty"`
-	Withdraw  []WithdrawConfig        `yaml:"withdraw,omitempty"`
-	Addresses map[string]AddressEntry `yaml:"addresses,omitempty"`
+	LND            LNDConfig               `yaml:"lnd"`
+	Ntfy           *NtfyConfig             `yaml:"ntfy,omitempty"`
+	WithdrawSecret string                  `yaml:"withdraw_secret,omitempty"`
+	Withdraw       []WithdrawConfig        `yaml:"withdraw,omitempty"`
+	Addresses      map[string]AddressEntry `yaml:"addresses,omitempty"`
 }
 
 type LNDConfig struct {
@@ -47,16 +49,20 @@ type AddressEntry struct {
 // Voucher is an expanded single withdraw voucher (after batch expansion).
 type Voucher struct {
 	ID          string
-	Token       string // URL-safe opaque token derived from ID
+	Token       string // URL-safe opaque token derived from ID and secret
 	Domain      string
 	Description string
 	Amount      int64 // millisatoshis
 }
 
-// tokenForVoucher generates a deterministic, unguessable URL token from a voucher ID.
-func tokenForVoucher(id string) string {
-	hash := sha256.Sum256([]byte(id))
-	return hex.EncodeToString(hash[:6]) // 12 hex chars, 48 bits
+const minWithdrawSecretLen = 32
+
+// tokenForVoucher generates a deterministic URL token from a voucher ID,
+// unguessable without the secret.
+func tokenForVoucher(secret, id string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(id))
+	return hex.EncodeToString(mac.Sum(nil)[:16])
 }
 
 func Load(path string) (*Config, error) {
@@ -77,6 +83,9 @@ func Load(path string) (*Config, error) {
 func (c *Config) Validate() error {
 	if c.LND.Host == "" {
 		return fmt.Errorf("lnd.host is required")
+	}
+	if len(c.Withdraw) > 0 && len(c.WithdrawSecret) < minWithdrawSecretLen {
+		return fmt.Errorf("withdraw_secret must be at least %d characters when withdraw vouchers are configured", minWithdrawSecretLen)
 	}
 	for i, w := range c.Withdraw {
 		if w.Domain == "" {
@@ -116,7 +125,7 @@ func (c *Config) ExpandVouchers() []Voucher {
 		if w.ID != "" {
 			vouchers = append(vouchers, Voucher{
 				ID:          w.ID,
-				Token:       tokenForVoucher(w.ID),
+				Token:       tokenForVoucher(c.WithdrawSecret, w.ID),
 				Domain:      w.Domain,
 				Description: w.Description,
 				Amount:      w.Amount,
@@ -126,7 +135,7 @@ func (c *Config) ExpandVouchers() []Voucher {
 				id := fmt.Sprintf("%s-%03d", w.Prefix, i)
 				vouchers = append(vouchers, Voucher{
 					ID:          id,
-					Token:       tokenForVoucher(id),
+					Token:       tokenForVoucher(c.WithdrawSecret, id),
 					Domain:      w.Domain,
 					Description: w.Description,
 					Amount:      w.Amount,
