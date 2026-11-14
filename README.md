@@ -27,7 +27,6 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
 - YAML configuration
 - Request rate limiting
 - Docker image and Compose file for deployment
-- CI via GitHub Actions
 
 ## Requirements
 
@@ -38,10 +37,9 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
 
 ## Quick start
 
-```bash
-git clone https://github.com/pycanis/lnurl-server.git
-cd lnurl-server
+From a checkout of the repository:
 
+```bash
 cp config.example.yaml config.yaml
 # edit config.yaml: your domain, address names, and LND connection details
 
