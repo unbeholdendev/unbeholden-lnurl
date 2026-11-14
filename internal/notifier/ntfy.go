@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"lnurl-server/internal/config"
+	"unbeholden-lnurl/internal/config"
 )
 
 // Ntfy sends push notifications via an ntfy server.

@@ -9,16 +9,16 @@ RUN go mod download
 
 # Build binary
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o lnurl-server ./cmd/lnurl-server
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o unbeholden-lnurl ./cmd/unbeholden-lnurl
 
 # Runtime stage
 FROM gcr.io/distroless/static:nonroot
 
 WORKDIR /app
 
-COPY --from=builder /build/lnurl-server /app/lnurl-server
+COPY --from=builder /build/unbeholden-lnurl /app/unbeholden-lnurl
 
 USER nonroot:nonroot
 
-ENTRYPOINT ["/app/lnurl-server"]
+ENTRYPOINT ["/app/unbeholden-lnurl"]
 CMD ["-config", "/app/config.yaml"]

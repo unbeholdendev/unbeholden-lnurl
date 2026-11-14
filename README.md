@@ -1,4 +1,4 @@
-# lnurl-server
+# unbeholden-lnurl
 
 A small, self-hosted Lightning Address server written in Go. It lets you receive Lightning
 payments at `you@yourdomain.com` using your own node, instead of relying on a custodial
@@ -77,11 +77,11 @@ invoice and hands it to the payer.
 ## Development
 
 ```bash
-go run ./cmd/lnurl-server
+go run ./cmd/unbeholden-lnurl
 go test ./...
 ```
 
-Layout follows the standard Go convention: entrypoint in `cmd/lnurl-server`, everything
+Layout follows the standard Go convention: entrypoint in `cmd/unbeholden-lnurl`, everything
 else under `internal/`.
 
 ## References

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"lnurl-server/internal/config"
+	"unbeholden-lnurl/internal/config"
 )
 
 func TestSaveStateConcurrency(t *testing.T) {

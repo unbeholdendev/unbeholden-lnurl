@@ -1,4 +1,4 @@
-module lnurl-server
+module unbeholden-lnurl
 
 go 1.25.0
 

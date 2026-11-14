@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"lnurl-server/internal/config"
+	"unbeholden-lnurl/internal/config"
 )
 
 func TestAddressMetadata_SimpleValues(t *testing.T) {

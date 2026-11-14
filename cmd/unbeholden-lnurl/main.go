@@ -10,11 +10,11 @@ import (
 	"syscall"
 	"time"
 
-	"lnurl-server/internal/config"
-	"lnurl-server/internal/lnd"
-	"lnurl-server/internal/lnurl"
-	"lnurl-server/internal/notifier"
-	"lnurl-server/internal/server"
+	"unbeholden-lnurl/internal/config"
+	"unbeholden-lnurl/internal/lnd"
+	"unbeholden-lnurl/internal/lnurl"
+	"unbeholden-lnurl/internal/notifier"
+	"unbeholden-lnurl/internal/server"
 )
 
 func main() {

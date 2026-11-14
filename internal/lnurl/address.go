@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"strconv"
 
-	"lnurl-server/internal/config"
-	"lnurl-server/internal/lnd"
-	"lnurl-server/internal/notifier"
+	"unbeholden-lnurl/internal/config"
+	"unbeholden-lnurl/internal/lnd"
+	"unbeholden-lnurl/internal/notifier"
 )
 
 // AddressHandler handles Lightning Address (LUD-16) requests.

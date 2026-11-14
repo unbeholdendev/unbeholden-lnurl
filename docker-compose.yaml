@@ -1,6 +1,6 @@
 services:
-  lnurl-server:
-    image: ghcr.io/pycanis/lnurl-server:latest
+  unbeholden-lnurl:
+    image: ghcr.io/unbeholdendev/unbeholden-lnurl:${TAG:-latest}
     ports:
       - "8080:8080"
     volumes:
@@ -9,7 +9,7 @@ services:
       - ./docker-data/tls.cert:/certs/tls.cert:ro
       - ./docker-data/admin.macaroon:/macaroons/admin.macaroon:ro
     healthcheck:
-      test: ["CMD", "/app/lnurl-server", "-healthcheck"]
+      test: ["CMD", "/app/unbeholden-lnurl", "-healthcheck"]
       interval: 30s
       timeout: 5s
       start_period: 10s

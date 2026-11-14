@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"sync"
 
-	"lnurl-server/internal/config"
-	"lnurl-server/internal/lnurl"
+	"unbeholden-lnurl/internal/config"
+	"unbeholden-lnurl/internal/lnurl"
 )
 
 const listenAddr = "0.0.0.0:8080"
