@@ -22,7 +22,10 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
 
 ## Features
 
-- LNURL-pay / Lightning Address support (LUD-06, LUD-16)
+- LNURL-pay / Lightning Address support (LUD-06, LUD-16, LUD-12 comments)
+- Notifications for every invoice settled on the node, via ntfy, including ones settled
+  while the service was down
+- LNURL-withdraw vouchers (LUD-03) listed in the config
 - LND backend over gRPC with macaroon authentication
 - YAML configuration
 - Request rate limiting
@@ -40,8 +43,9 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
 From a checkout of the repository:
 
 ```bash
-cp config.example.yaml config.yaml
-# edit config.yaml: your domain, address names, and LND connection details
+mkdir -p docker-data
+cp config.example.yaml docker-data/config.yaml
+# edit docker-data/config.yaml: your domain, address names, and LND connection details
 
 docker compose up -d
 ```
@@ -54,9 +58,11 @@ curl https://yourdomain.com/.well-known/lnurlp/you
 
 ## Configuration
 
-See [`config.example.yaml`](./config.example.yaml) for all available options, including the
-LND host, TLS certificate and macaroon paths, the addresses to serve, and the sendable
-amount limits.
+See [`config.example.yaml`](./config.example.yaml) for all available options.
+
+Each feature runs only when its section is present: `addresses` for Lightning Addresses,
+`withdraw` for vouchers, `notifications` for payment notifications. With only
+`notifications`, no HTTP listener is started.
 
 ## Endpoints
 
@@ -67,12 +73,20 @@ amount limits.
 
 ## Security notes
 
-Use an **invoice-only macaroon** rather than `admin.macaroon`. The server only ever needs to
-create invoices, so it should not be able to move funds or read your channel state. You can
-bake a restricted macaroon with `lncli bakemacaroon`.
+Give the server a macaroon with only the permissions its enabled features need, never
+`admin.macaroon`:
 
-The server never holds keys and never has spending authority — it asks your node for an
-invoice and hands it to the payer.
+| Feature | Permissions |
+| --- | --- |
+| `addresses` | `invoices:write` |
+| `notifications` | `invoices:read` |
+| `withdraw` | `offchain:write` |
+
+LND's `invoice.macaroon` covers addresses and notifications. Bake others with
+`lncli bakemacaroon`.
+
+Without `withdraw`, the server cannot move funds: it asks your node for an invoice and hands
+it to the payer.
 
 ## Development
 

@@ -42,19 +42,19 @@ func (n *Ntfy) NotifyInvoiceCreated(amountSats int64, address string, comment st
 	if comment != "" {
 		body = fmt.Sprintf("Invoice created: %d sats for %s: %s", amountSats, address, comment)
 	}
-	n.send("Invoice created", body)
+	n.sendOrLog("Invoice created", body)
 }
 
 // NotifyPayment sends a notification for a settled payment.
-func (n *Ntfy) NotifyPayment(amountSats int64, memo string) {
+func (n *Ntfy) NotifyPayment(amountSats int64, memo string) error {
 	if n == nil {
-		return
+		return nil
 	}
 	body := fmt.Sprintf("Received %d sats", amountSats)
 	if memo != "" {
 		body = fmt.Sprintf("Received %d sats: %s", amountSats, memo)
 	}
-	n.send("Payment received", body)
+	return n.send("Payment received", body)
 }
 
 // NotifyVoucherClaimed sends a notification for a claimed withdraw voucher.
@@ -63,15 +63,14 @@ func (n *Ntfy) NotifyVoucherClaimed(voucherID string, amountSats int64) {
 		return
 	}
 	body := fmt.Sprintf("Voucher %s claimed (%d sats)", voucherID, amountSats)
-	n.send("Voucher claimed", body)
+	n.sendOrLog("Voucher claimed", body)
 }
 
-func (n *Ntfy) send(title, body string) {
+func (n *Ntfy) send(title, body string) error {
 	url := fmt.Sprintf("%s/%s", n.url, n.topic)
 	req, err := http.NewRequest("POST", url, bytes.NewBufferString(body))
 	if err != nil {
-		log.Printf("ntfy: failed to create request: %v", err)
-		return
+		return fmt.Errorf("ntfy: create request: %w", err)
 	}
 	req.Header.Set("Title", title)
 	if n.token != "" {
@@ -80,12 +79,18 @@ func (n *Ntfy) send(title, body string) {
 
 	resp, err := n.client.Do(req)
 	if err != nil {
-		log.Printf("ntfy: failed to send notification: %v", err)
-		return
+		return fmt.Errorf("ntfy: send: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("ntfy: unexpected status code: %d", resp.StatusCode)
+		return fmt.Errorf("ntfy: unexpected status code: %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (n *Ntfy) sendOrLog(title, body string) {
+	if err := n.send(title, body); err != nil {
+		log.Print(err)
 	}
 }

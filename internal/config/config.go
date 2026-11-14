@@ -6,26 +6,36 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
+	Listen         string                  `yaml:"listen,omitempty"`
 	LND            LNDConfig               `yaml:"lnd"`
-	Ntfy           *NtfyConfig             `yaml:"ntfy,omitempty"`
+	StateDir       string                  `yaml:"state_dir,omitempty"`
+	Notifications  NotificationsConfig     `yaml:"notifications,omitempty"`
 	WithdrawSecret string                  `yaml:"withdraw_secret,omitempty"`
 	Withdraw       []WithdrawConfig        `yaml:"withdraw,omitempty"`
 	Addresses      map[string]AddressEntry `yaml:"addresses,omitempty"`
 }
 
 type LNDConfig struct {
-	Host string `yaml:"host"`
+	Host     string `yaml:"host"`
+	TLSCert  string `yaml:"tls_cert"`
+	Macaroon string `yaml:"macaroon"`
+}
+
+type NotificationsConfig struct {
+	Ntfy *NtfyConfig `yaml:"ntfy,omitempty"`
 }
 
 type NtfyConfig struct {
-	URL   string `yaml:"url"`
-	Topic string `yaml:"topic"`
-	Token string `yaml:"token,omitempty"`
+	URL       string `yaml:"url"`
+	Topic     string `yaml:"topic"`
+	Token     string `yaml:"token,omitempty"`
+	TokenFile string `yaml:"token_file,omitempty"`
 }
 
 type WithdrawConfig struct {
@@ -77,12 +87,42 @@ func Load(path string) (*Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
+	if n := cfg.Notifications.Ntfy; n != nil && n.TokenFile != "" {
+		token, err := os.ReadFile(n.TokenFile)
+		if err != nil {
+			return nil, fmt.Errorf("read notifications.ntfy.token_file: %w", err)
+		}
+		n.Token = strings.TrimSpace(string(token))
+	}
 	return &cfg, nil
 }
 
 func (c *Config) Validate() error {
 	if c.LND.Host == "" {
 		return fmt.Errorf("lnd.host is required")
+	}
+	if c.LND.TLSCert == "" {
+		return fmt.Errorf("lnd.tls_cert is required")
+	}
+	if c.LND.Macaroon == "" {
+		return fmt.Errorf("lnd.macaroon is required")
+	}
+	if !c.ServesHTTP() && !c.Notifies() {
+		return fmt.Errorf("nothing to do: configure addresses, withdraw or notifications")
+	}
+	if c.ServesHTTP() && c.Listen == "" {
+		return fmt.Errorf("listen is required with addresses or withdraw vouchers")
+	}
+	if (c.Notifies() || len(c.Withdraw) > 0) && c.StateDir == "" {
+		return fmt.Errorf("state_dir is required with notifications or withdraw vouchers")
+	}
+	if n := c.Notifications.Ntfy; n != nil {
+		if n.URL == "" || n.Topic == "" {
+			return fmt.Errorf("notifications.ntfy needs url and topic")
+		}
+		if n.Token != "" && n.TokenFile != "" {
+			return fmt.Errorf("notifications.ntfy: set token or token_file, not both")
+		}
 	}
 	if len(c.Withdraw) > 0 && len(c.WithdrawSecret) < minWithdrawSecretLen {
 		return fmt.Errorf("withdraw_secret must be at least %d characters when withdraw vouchers are configured", minWithdrawSecretLen)
@@ -116,6 +156,16 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// ServesHTTP reports whether any configured feature needs the HTTP listener.
+func (c *Config) ServesHTTP() bool {
+	return len(c.Addresses) > 0 || len(c.Withdraw) > 0
+}
+
+// Notifies reports whether any notification channel is configured.
+func (c *Config) Notifies() bool {
+	return c.Notifications.Ntfy != nil
 }
 
 // ExpandVouchers expands batch withdraw entries into individual Voucher structs.

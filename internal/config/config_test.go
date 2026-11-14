@@ -8,10 +8,20 @@ import (
 	"testing"
 )
 
-func TestLoad_MinimalConfig(t *testing.T) {
-	yaml := `
+const lndYAML = `
 lnd:
   host: "localhost:10009"
+  tls_cert: "/tls.cert"
+  macaroon: "/invoice.macaroon"
+`
+
+func TestLoad_MinimalConfig(t *testing.T) {
+	yaml := lndYAML + `
+listen: "127.0.0.1:8080"
+addresses:
+  "*":
+    min_sendable: 1000
+    max_sendable: 2000
 `
 	path := writeTestConfig(t, yaml)
 	cfg, err := Load(path)
@@ -36,9 +46,9 @@ lnd:
 }
 
 func TestLoad_WithdrawRequiresSecret(t *testing.T) {
-	yaml := `
-lnd:
-  host: "localhost:10009"
+	yaml := lndYAML + `
+listen: "127.0.0.1:8080"
+state_dir: "/var/lib/x"
 withdraw:
   - id: "tip-001"
     domain: "example.com"
@@ -47,6 +57,55 @@ withdraw:
 	path := writeTestConfig(t, yaml)
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected error for withdraw without withdraw_secret")
+	}
+}
+
+func TestLoad_RejectsIncompleteFeatures(t *testing.T) {
+	cases := map[string]string{
+		"no features": "",
+		"addresses without listen": `
+addresses:
+  "*":
+    min_sendable: 1000
+    max_sendable: 2000
+`,
+		"notifications without state_dir": `
+notifications:
+  ntfy:
+    url: "https://ntfy.example.com"
+    topic: "t"
+`,
+	}
+	for name, extra := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeTestConfig(t, lndYAML+extra)); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestLoad_NotificationsOnly(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("tk_secret\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(writeTestConfig(t, lndYAML+`
+state_dir: "/var/lib/x"
+notifications:
+  ntfy:
+    url: "https://ntfy.example.com"
+    topic: "t"
+    token_file: "`+tokenFile+`"
+`))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.ServesHTTP() {
+		t.Error("serves HTTP without addresses or withdraw")
+	}
+	if got := cfg.Notifications.Ntfy.Token; got != "tk_secret" {
+		t.Errorf("token = %q, want tk_secret", got)
 	}
 }
 

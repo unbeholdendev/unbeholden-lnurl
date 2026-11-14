@@ -1,22 +1,19 @@
 package lnd
 
 import (
+	"cmp"
 	"context"
 	"crypto/x509"
 	"encoding/hex"
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"gopkg.in/macaroon.v2"
-)
-
-const (
-	tlsCertPath  = "/certs/tls.cert"
-	macaroonPath = "/macaroons/admin.macaroon"
 )
 
 // Client wraps the LND gRPC connection and exposes the methods we need.
@@ -27,7 +24,7 @@ type Client struct {
 }
 
 // Connect establishes a gRPC connection to LND using TLS and macaroon auth.
-func Connect(host string) (*Client, error) {
+func Connect(host, tlsCertPath, macaroonPath string) (*Client, error) {
 	// Load TLS cert
 	tlsCert, err := os.ReadFile(tlsCertPath)
 	if err != nil {
@@ -114,16 +111,74 @@ func (c *Client) SendPayment(ctx context.Context, bolt11 string, maxFeeSat int64
 	}
 }
 
-// SubscribeInvoices opens a stream of invoice updates from LND.
-// The callback is called for each settled invoice with the amount in msats
-// and the description hash.
-func (c *Client) SubscribeInvoices(ctx context.Context, onSettled func(amountMsat int64, descriptionHash []byte, memo string)) error {
+// LastSettleIndex returns the highest settle index on the node, or 0 if no
+// invoice has settled.
+func (c *Client) LastSettleIndex(ctx context.Context) (uint64, error) {
+	invoices, err := c.settledInvoices(ctx)
+	if err != nil || len(invoices) == 0 {
+		return 0, err
+	}
+	return invoices[len(invoices)-1].SettleIndex, nil
+}
+
+// settledInvoices returns every settled invoice on the node, in settle order.
+func (c *Client) settledInvoices(ctx context.Context) ([]*lnrpc.Invoice, error) {
+	var settled []*lnrpc.Invoice
+	var offset uint64
+	for {
+		resp, err := c.lightning.ListInvoices(ctx, &lnrpc.ListInvoiceRequest{
+			IndexOffset:    offset,
+			NumMaxInvoices: 1000,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list invoices: %w", err)
+		}
+		if len(resp.Invoices) == 0 {
+			slices.SortFunc(settled, func(a, b *lnrpc.Invoice) int {
+				return cmp.Compare(a.SettleIndex, b.SettleIndex)
+			})
+			return settled, nil
+		}
+		for _, invoice := range resp.Invoices {
+			if invoice.State == lnrpc.Invoice_SETTLED {
+				settled = append(settled, invoice)
+			}
+		}
+		offset = resp.LastIndexOffset
+	}
+}
+
+// SubscribeInvoices streams invoices settled after settleIndex to onSettled,
+// until the stream ends or onSettled returns an error. resumeFrom is a settle
+// index to resubscribe from that loses no invoice not yet passed to onSettled.
+func (c *Client) SubscribeInvoices(ctx context.Context, settleIndex uint64, onSettled func(amountMsat int64, memo string, resumeFrom uint64) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	stream, err := c.lightning.SubscribeInvoices(ctx, &lnrpc.InvoiceSubscription{
-		AddIndex:    0,
-		SettleIndex: 0,
+		SettleIndex: settleIndex,
 	})
 	if err != nil {
 		return fmt.Errorf("subscribe invoices: %w", err)
+	}
+
+	// LND replays nothing for a settle index of 0, so list every settled
+	// invoice. The list is not a snapshot: an invoice settled while it is read
+	// may be missing from it while a later one is present. Listed invoices
+	// therefore resume from 0. The stream, opened first, delivers the rest in
+	// settle order, so each of its invoices is a safe point to resume from.
+	listed := map[uint64]bool{}
+	if settleIndex == 0 {
+		invoices, err := c.settledInvoices(ctx)
+		if err != nil {
+			return err
+		}
+		for _, invoice := range invoices {
+			listed[invoice.SettleIndex] = true
+			if err := onSettled(invoice.AmtPaidMsat, invoice.Memo, 0); err != nil {
+				return err
+			}
+		}
 	}
 
 	for {
@@ -131,8 +186,11 @@ func (c *Client) SubscribeInvoices(ctx context.Context, onSettled func(amountMsa
 		if err != nil {
 			return fmt.Errorf("recv invoice: %w", err)
 		}
-		if invoice.State == lnrpc.Invoice_SETTLED {
-			onSettled(invoice.AmtPaidMsat, invoice.DescriptionHash, invoice.Memo)
+		if invoice.State != lnrpc.Invoice_SETTLED || listed[invoice.SettleIndex] {
+			continue
+		}
+		if err := onSettled(invoice.AmtPaidMsat, invoice.Memo, invoice.SettleIndex); err != nil {
+			return err
 		}
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,42 +24,57 @@ func main() {
 	healthcheck := flag.Bool("healthcheck", false, "run health check and exit")
 	flag.Parse()
 
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("failed to load config: %v", err)
+	}
+
 	if *healthcheck {
-		resp, err := http.Get("http://localhost:8080/health")
+		resp, err := http.Get("http://" + cfg.Listen + "/health")
 		if err != nil || resp.StatusCode != http.StatusOK {
 			os.Exit(1)
 		}
 		os.Exit(0)
 	}
-
-	// Load config
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
-	}
 	log.Printf("config loaded from %s", *configPath)
 
-	// Connect to LND
-	lndClient, err := lnd.Connect(cfg.LND.Host)
+	lndClient, err := lnd.Connect(cfg.LND.Host, cfg.LND.TLSCert, cfg.LND.Macaroon)
 	if err != nil {
 		log.Fatalf("failed to connect to lnd: %v", err)
 	}
 	defer lndClient.Close()
 	log.Printf("connected to lnd at %s", cfg.LND.Host)
 
-	// Create notifier
-	ntfy := notifier.NewNtfy(cfg.Ntfy)
+	ntfy := notifier.NewNtfy(cfg.Notifications.Ntfy)
 
-	// Create handlers
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	if cfg.Notifies() {
+		wg.Go(func() {
+			notifier.WatchSettled(ctx, lndClient, filepath.Join(cfg.StateDir, "settle_index"), ntfy)
+		})
+	}
+
+	if cfg.ServesHTTP() {
+		serve(ctx, cfg, lndClient, ntfy)
+	}
+
+	<-ctx.Done()
+	log.Println("shutting down")
+	wg.Wait()
+}
+
+func serve(ctx context.Context, cfg *config.Config, lndClient *lnd.Client, ntfy *notifier.Ntfy) {
 	withdrawHandler := lnurl.NewWithdrawHandler(
 		cfg.ExpandVouchers(),
 		lndClient,
 		ntfy,
-		"data/state.json",
+		filepath.Join(cfg.StateDir, "state.json"),
 	)
 	addressHandler := lnurl.NewAddressHandler(cfg.Addresses, lndClient, ntfy)
 
-	// Print unclaimed withdraw voucher URLs
 	if withdrawHandler != nil {
 		unclaimed := withdrawHandler.UnclaimedVouchers()
 		log.Printf("withdraw vouchers: %d unclaimed", len(unclaimed))
@@ -65,35 +82,15 @@ func main() {
 			log.Printf("  %s (%d sats) %s", v.ID, v.Amount/1000, v.URL)
 			log.Printf("    %s", v.LNURL)
 		}
-	}
-
-	// Start invoice subscriber in background
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	if withdrawHandler != nil {
 		go withdrawHandler.StartCleanup(ctx)
 	}
 
-	go runInvoiceSubscriber(ctx, lndClient, ntfy)
-
-	// Start HTTP server
 	srv := server.New(cfg, withdrawHandler, addressHandler)
 
-	// Handle shutdown signals
 	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		sig := <-sigCh
-		log.Printf("received signal %v, shutting down...", sig)
-
-		// Cancel background goroutines
-		cancel()
-
-		// Give in-flight requests up to 30 seconds to complete
+		<-ctx.Done()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer shutdownCancel()
-
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			log.Printf("shutdown error: %v", err)
 		}
@@ -101,41 +98,5 @@ func main() {
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
-	}
-
-	log.Println("server stopped")
-}
-
-func runInvoiceSubscriber(ctx context.Context, lndClient *lnd.Client, ntfy *notifier.Ntfy) {
-	backoff := 1 * time.Second
-	const maxBackoff = 30 * time.Second
-
-	for {
-		log.Println("starting invoice subscriber...")
-		start := time.Now()
-		err := lndClient.SubscribeInvoices(ctx, func(amountMsat int64, descriptionHash []byte, memo string) {
-			amountSats := amountMsat / 1000
-			log.Printf("invoice settled: %d sats", amountSats)
-			ntfy.NotifyPayment(amountSats, memo)
-		})
-
-		if ctx.Err() != nil {
-			return // context cancelled, shutting down
-		}
-
-		// Reset backoff if the connection lasted more than a minute
-		if time.Since(start) > time.Minute {
-			backoff = 1 * time.Second
-		}
-
-		log.Printf("invoice subscriber disconnected: %v, reconnecting in %s...", err, backoff)
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-
-		backoff = min(backoff*2, maxBackoff)
 	}
 }

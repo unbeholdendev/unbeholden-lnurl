@@ -1,10 +1,21 @@
+# Each feature runs when its section is present: addresses and withdraw need
+# listen, notifications and withdraw need state_dir.
+listen: "0.0.0.0:8080"
+state_dir: "/app/data"
+
 lnd:
   host: "lnd:10009"
+  tls_cert: "/certs/tls.cert"
+  macaroon: "/macaroons/invoice.macaroon"
 
-ntfy:
-  url: "https://ntfy.yourdomain.com"
-  topic: "lightning-payments"
-  token: ""
+# Notifies about every invoice settled on the node, including ones settled
+# while this service was down.
+notifications:
+  ntfy:
+    url: "https://ntfy.yourdomain.com"
+    topic: "lightning-payments"
+    # Or token_file: a file holding the token.
+    token: ""
 
 # Required with withdraw vouchers. Generate with: openssl rand -hex 32
 # Changing it changes every voucher URL.

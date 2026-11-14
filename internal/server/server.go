@@ -10,8 +10,6 @@ import (
 	"unbeholden-lnurl/internal/lnurl"
 )
 
-const listenAddr = "0.0.0.0:8080"
-
 // Server is the main HTTP server.
 type Server struct {
 	cfg        *config.Config
@@ -70,11 +68,11 @@ func (s *Server) ListenAndServe() error {
 	handler = s.rl.middleware(handler)
 
 	s.httpServer = &http.Server{
-		Addr:    listenAddr,
+		Addr:    s.cfg.Listen,
 		Handler: handler,
 	}
 
-	log.Printf("starting server on %s", listenAddr)
+	log.Printf("starting server on %s", s.cfg.Listen)
 	return s.httpServer.ListenAndServe()
 }
 

@@ -7,7 +7,7 @@ services:
       - ./docker-data/config.yaml:/app/config.yaml:ro
       - ./docker-data/data:/app/data
       - ./docker-data/tls.cert:/certs/tls.cert:ro
-      - ./docker-data/admin.macaroon:/macaroons/admin.macaroon:ro
+      - ./docker-data/invoice.macaroon:/macaroons/invoice.macaroon:ro
     healthcheck:
       test: ["CMD", "/app/unbeholden-lnurl", "-healthcheck"]
       interval: 30s
