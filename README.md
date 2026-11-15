@@ -6,7 +6,7 @@ provider.
 
 Most Lightning Addresses are issued by a third party. That means someone else's server
 creates the invoices you get paid with, and sees who is paying you. This serves them from
-your own LND node instead.
+your own LND or Core Lightning node instead.
 
 ## How it works
 
@@ -16,8 +16,7 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
 2. The server replies with a `payRequest` document: callback URL, min/max sendable amounts,
    and metadata
 3. The wallet calls the callback with the amount it wants to send
-4. The server asks LND to create an invoice (`AddInvoice` over gRPC) and returns the BOLT11
-   string
+4. The server asks your node to create an invoice and returns the BOLT11 string
 5. The wallet pays the invoice and the funds settle in your node
 
 ## Features
@@ -27,13 +26,17 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
   while the service was down
 - LNURL-withdraw vouchers (LUD-03) listed in the config
 - LND backend over gRPC with macaroon authentication
+- Core Lightning backend over CLNRest with rune authentication
 - YAML configuration
 - Request rate limiting
 - Docker image and Compose file for deployment
 
 ## Requirements
 
-- A running LND node reachable over gRPC, plus its TLS certificate and a macaroon
+- One of:
+  - an LND node reachable over gRPC, plus its TLS certificate and a macaroon
+  - a Core Lightning node with CLNRest enabled (`clnrest-port`), plus a rune and the
+    node's `ca.pem`
 - A domain with HTTPS terminated in front of the server (Caddy, nginx, or similar).
   The `.well-known` endpoint must be served over TLS for wallets to accept it.
 - Go 1.25+ if building from source
@@ -45,7 +48,7 @@ From a checkout of the repository:
 ```bash
 mkdir -p docker-data
 cp config.example.yaml docker-data/config.yaml
-# edit docker-data/config.yaml: your domain, address names, and LND connection details
+# edit docker-data/config.yaml: your address names and node connection details
 
 docker compose up -d
 ```
@@ -59,6 +62,8 @@ curl https://yourdomain.com/.well-known/lnurlp/you
 ## Configuration
 
 See [`config.example.yaml`](./config.example.yaml) for all available options.
+
+Configure one node, under `lnd` or `cln`.
 
 Each feature runs only when its section is present: `addresses` for Lightning Addresses,
 `withdraw` for vouchers, `notifications` for payment notifications. With only
@@ -99,6 +104,23 @@ Give the server a macaroon with only the permissions its enabled features need, 
 LND's `invoice.macaroon` covers addresses and notifications. Bake others with
 `lncli bakemacaroon`.
 
+On Core Lightning, give a rune limited to the methods the enabled features call:
+
+| Feature | Methods |
+| --- | --- |
+| `addresses` | `invoice` |
+| `notifications` | `listinvoices`, `waitanyinvoice` |
+| `withdraw` | `pay`, `listpays`, `getinfo` |
+
+For example, for addresses and notifications:
+
+```bash
+lightning-cli createrune restrictions='[["method=invoice","method=listinvoices","method=waitanyinvoice"]]'
+```
+
+Core Lightning stores no memo on an invoice, so the payer's comment is kept in the
+invoice's label.
+
 Without `withdraw`, the server cannot move funds: it asks your node for an invoice and hands
 it to the payer.
 
@@ -117,6 +139,7 @@ else under `internal/`.
 - [LNURL specifications (LUDs)](https://github.com/lnurl/luds)
 - [LUD-16: Lightning Address](https://github.com/lnurl/luds/blob/luds/16.md)
 - [LND API reference](https://lightning.engineering/api-docs/api/lnd/)
+- [Core Lightning RPC reference](https://docs.corelightning.org/reference)
 
 ## License
 

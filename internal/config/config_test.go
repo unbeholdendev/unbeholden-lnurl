@@ -187,3 +187,38 @@ trusted_proxies: ["`+bad+`"]
 		}
 	}
 }
+
+func TestLoad_NeedsExactlyOneNode(t *testing.T) {
+	const notify = `
+state_dir: "/var/lib/x"
+notifications:
+  ntfy:
+    url: "https://ntfy.example.com"
+    topic: "t"
+`
+	const clnYAML = `
+cln:
+  url: "https://cln:3010"
+  rune_file: "/rune"
+`
+	cfg, err := Load(writeTestConfig(t, clnYAML+notify))
+	if err != nil {
+		t.Fatalf("load cln config: %v", err)
+	}
+	if cfg.CLN.URL != "https://cln:3010" || cfg.LND != nil {
+		t.Errorf("cln = %+v, lnd = %+v", cfg.CLN, cfg.LND)
+	}
+
+	cases := map[string]string{
+		"no node":          notify,
+		"both nodes":       lndYAML + clnYAML + notify,
+		"cln without rune": "cln:\n  url: \"https://cln:3010\"\n" + notify,
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeTestConfig(t, yaml)); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}

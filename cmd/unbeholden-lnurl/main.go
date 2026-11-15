@@ -14,8 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/btcsuite/btcd/chaincfg"
 	"golang.org/x/sync/errgroup"
 
+	"unbeholden-lnurl/internal/cln"
 	"unbeholden-lnurl/internal/config"
 	"unbeholden-lnurl/internal/lnd"
 	"unbeholden-lnurl/internal/lnurl"
@@ -66,13 +68,39 @@ func checkHealth(listen string) error {
 	return nil
 }
 
-func run(ctx context.Context, cfg *config.Config) error {
-	lndClient, err := lnd.Connect(cfg.LND.Host, cfg.LND.TLSCert, cfg.LND.Macaroon)
-	if err != nil {
-		return fmt.Errorf("lnd: %w", err)
+// node is a Lightning node backend.
+type node interface {
+	lnurl.Invoicer
+	lnurl.Payer
+	notifier.Invoices
+	Network(ctx context.Context) (*chaincfg.Params, error)
+	Close() error
+}
+
+func connect(cfg *config.Config) (node, error) {
+	if c := cfg.CLN; c != nil {
+		client, err := cln.Connect(c.URL, c.RuneFile, c.CACert)
+		if err != nil {
+			return nil, fmt.Errorf("cln: %w", err)
+		}
+		slog.Info("using cln", "url", c.URL)
+		return client, nil
 	}
-	defer lndClient.Close()
-	slog.Info("using lnd", "host", cfg.LND.Host)
+	l := cfg.LND
+	client, err := lnd.Connect(l.Host, l.TLSCert, l.Macaroon)
+	if err != nil {
+		return nil, fmt.Errorf("lnd: %w", err)
+	}
+	slog.Info("using lnd", "host", l.Host)
+	return client, nil
+}
+
+func run(ctx context.Context, cfg *config.Config) error {
+	node, err := connect(cfg)
+	if err != nil {
+		return err
+	}
+	defer node.Close()
 
 	var ntfy *notifier.Ntfy
 	// Kept apart from ntfy: a nil *Ntfy in an interface is not a nil Notifier.
@@ -84,7 +112,7 @@ func run(ctx context.Context, cfg *config.Config) error {
 
 	g, ctx := errgroup.WithContext(ctx)
 	if cfg.ServesHTTP() {
-		srv, err := newServer(ctx, cfg, lndClient, notify)
+		srv, err := newServer(ctx, cfg, node, notify)
 		if err != nil {
 			return err
 		}
@@ -97,25 +125,27 @@ func run(ctx context.Context, cfg *config.Config) error {
 	}
 	if ntfy != nil {
 		g.Go(func() error {
-			notifier.WatchSettled(ctx, lndClient, filepath.Join(cfg.StateDir, "settle_index"), ntfy)
+			// Named before Core Lightning support; a new name would lose the
+			// position of existing deployments.
+			notifier.WatchSettled(ctx, node, filepath.Join(cfg.StateDir, "settle_index"), ntfy)
 			return nil
 		})
 	}
 	return g.Wait()
 }
 
-func newServer(ctx context.Context, cfg *config.Config, lndClient *lnd.Client, notify lnurl.Notifier) (*http.Server, error) {
+func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.Notifier) (*http.Server, error) {
 	var withdrawHandler *lnurl.WithdrawHandler
 	if len(cfg.Withdraw) > 0 {
-		network, err := lndClient.Network(ctx)
+		network, err := node.Network(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("get lnd network: %w", err)
+			return nil, fmt.Errorf("get node network: %w", err)
 		}
 		withdrawHandler, err = lnurl.NewWithdrawHandler(
 			cfg.ExpandVouchers(),
 			cfg.WithdrawK1Key(),
 			network,
-			lndClient,
+			node,
 			notify,
 			filepath.Join(cfg.StateDir, "state.json"),
 		)
@@ -130,7 +160,7 @@ func newServer(ctx context.Context, cfg *config.Config, lndClient *lnd.Client, n
 	}
 	var addressHandler *lnurl.AddressHandler
 	if len(cfg.Addresses) > 0 {
-		addressHandler = lnurl.NewAddressHandler(cfg.Addresses, lndClient, notify)
+		addressHandler = lnurl.NewAddressHandler(cfg.Addresses, node, notify)
 	}
 	return server.New(cfg.TrustedProxies, withdrawHandler, addressHandler), nil
 }

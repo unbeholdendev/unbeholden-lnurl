@@ -13,20 +13,20 @@ import (
 )
 
 type fakeInvoices struct {
-	lastSettleIndex uint64
-	settled         []uint64
-	from            []uint64
-	cancel          context.CancelFunc
+	lastPaidIndex uint64
+	settled       []uint64
+	from          []uint64
+	cancel        context.CancelFunc
 }
 
-func (f *fakeInvoices) LastSettleIndex(context.Context) (uint64, error) {
-	return f.lastSettleIndex, nil
+func (f *fakeInvoices) LastPaidIndex(context.Context) (uint64, error) {
+	return f.lastPaidIndex, nil
 }
 
-func (f *fakeInvoices) SubscribeInvoices(ctx context.Context, settleIndex uint64, onSettled func(int64, string, uint64) error) error {
-	f.from = append(f.from, settleIndex)
+func (f *fakeInvoices) SubscribeInvoices(ctx context.Context, after uint64, onSettled func(int64, string, uint64) error) error {
+	f.from = append(f.from, after)
 	for _, i := range f.settled {
-		if i <= settleIndex {
+		if i <= after {
 			continue
 		}
 		if err := onSettled(1000*int64(i), "", i); err != nil {
@@ -68,13 +68,13 @@ func TestWatchSettled_FirstStartSkipsHistoryAndRecordsBaseline(t *testing.T) {
 	n, delivered := ntfyServer(t, func(string) bool { return false })
 	statePath := filepath.Join(t.TempDir(), "settle_index")
 
-	f := &fakeInvoices{lastSettleIndex: 7, settled: []uint64{5, 6, 7}}
+	f := &fakeInvoices{lastPaidIndex: 7, settled: []uint64{5, 6, 7}}
 	f.watch(t, statePath, n)
 	if f.from[0] != 7 {
 		t.Fatalf("first start subscribed from %d, want 7", f.from[0])
 	}
 
-	f.lastSettleIndex = 9
+	f.lastPaidIndex = 9
 	f.settled = append(f.settled, 8, 9)
 	f.watch(t, statePath, n)
 	if f.from[0] != 7 {

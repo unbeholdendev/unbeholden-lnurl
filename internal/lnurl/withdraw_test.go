@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"unbeholden-lnurl/internal/config"
-	"unbeholden-lnurl/internal/lnd"
+	"unbeholden-lnurl/internal/lightning"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
@@ -44,7 +44,7 @@ func (f *fakeNode) SendPayment(ctx context.Context, _ string, _ int64) error {
 	return nil
 }
 
-func (f *fakeNode) AddInvoice(_ context.Context, amountMsat int64, _ []byte, memo string) (string, error) {
+func (f *fakeNode) AddInvoice(_ context.Context, amountMsat int64, _, memo string) (string, error) {
 	return fmt.Sprintf("lnbc-%d-%s", amountMsat, memo), nil
 }
 
@@ -215,7 +215,7 @@ func TestWithdraw_PaymentOutlivesRequest(t *testing.T) {
 func TestWithdraw_DefiniteFailureReleases(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	node := &fakeNode{pay: func(context.Context) error {
-		return fmt.Errorf("%w: FAILURE_REASON_NO_ROUTE", lnd.ErrPaymentFailed)
+		return fmt.Errorf("%w: FAILURE_REASON_NO_ROUTE", lightning.ErrPaymentFailed)
 	}}
 	h := newWithdraw(t, node, statePath)
 

@@ -17,7 +17,7 @@ import (
 
 	"unbeholden-lnurl/internal/atomicfile"
 	"unbeholden-lnurl/internal/config"
-	"unbeholden-lnurl/internal/lnd"
+	"unbeholden-lnurl/internal/lightning"
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/lightningnetwork/lnd/zpay32"
@@ -30,7 +30,7 @@ const PayTimeout = 2 * time.Minute
 
 // Payer pays BOLT-11 invoices.
 type Payer interface {
-	// SendPayment pays bolt11. An error wrapping lnd.ErrPaymentFailed means
+	// SendPayment pays bolt11. An error wrapping lightning.ErrPaymentFailed means
 	// the payment definitely failed; any other error leaves it unknown.
 	SendPayment(ctx context.Context, bolt11 string, maxFeeSat int64) error
 }
@@ -166,7 +166,7 @@ func (h *WithdrawHandler) HandleClaim(w http.ResponseWriter, r *http.Request) {
 	maxFeeSat := max(voucher.Amount/100000, 10)
 	err = h.payer.SendPayment(ctx, pr, maxFeeSat)
 	switch {
-	case errors.Is(err, lnd.ErrPaymentFailed):
+	case errors.Is(err, lightning.ErrPaymentFailed):
 		slog.Warn("withdraw payment failed", "voucher", voucher.ID, "err", err)
 		if err := h.release(voucher.ID); err != nil {
 			slog.Error("withdraw release not saved", "voucher", voucher.ID, "err", err)

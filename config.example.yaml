@@ -8,10 +8,17 @@ state_dir: "/app/data"
 trusted_proxies:
   - "172.16.0.0/12"
 
+# One node: lnd or cln.
 lnd:
   host: "lnd:10009"
   tls_cert: "/certs/tls.cert"
   macaroon: "/macaroons/invoice.macaroon"
+
+# cln:
+#   url: "https://cln:3010"
+#   rune_file: "/certs/rune"
+#   # The node's ca.pem. Without it, the server needs a publicly trusted certificate.
+#   ca_cert: "/certs/ca.pem"
 
 # Notifies about every invoice settled on the node, including ones settled
 # while this service was down.

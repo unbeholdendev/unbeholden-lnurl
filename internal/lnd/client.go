@@ -3,9 +3,9 @@ package lnd
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -16,6 +16,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"gopkg.in/macaroon.v2"
+
+	"unbeholden-lnurl/internal/lightning"
 )
 
 // Client wraps the LND gRPC connection and exposes the methods we need.
@@ -67,14 +69,13 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// AddInvoice creates a new invoice on LND.
-// amountMsat is the invoice amount in millisatoshis.
-// descriptionHash is the SHA256 hash of the LNURL metadata string (32 bytes).
-// memo is an optional human-readable description stored on the invoice.
-func (c *Client) AddInvoice(ctx context.Context, amountMsat int64, descriptionHash []byte, memo string) (string, error) {
+// AddInvoice creates an invoice for amountMsat committing to the hash of
+// description, with memo stored on the node.
+func (c *Client) AddInvoice(ctx context.Context, amountMsat int64, description, memo string) (string, error) {
+	descriptionHash := sha256.Sum256([]byte(description))
 	resp, err := c.lightning.AddInvoice(ctx, &lnrpc.Invoice{
 		ValueMsat:       amountMsat,
-		DescriptionHash: descriptionHash,
+		DescriptionHash: descriptionHash[:],
 		Memo:            memo,
 	})
 	if err != nil {
@@ -83,11 +84,8 @@ func (c *Client) AddInvoice(ctx context.Context, amountMsat int64, descriptionHa
 	return resp.PaymentRequest, nil
 }
 
-// ErrPaymentFailed is returned by SendPayment when LND reports the payment
-// as failed, so no part of it can still settle.
-var ErrPaymentFailed = errors.New("payment failed")
-
-// SendPayment pays a BOLT-11 invoice. An error wrapping ErrPaymentFailed means
+// SendPayment pays a BOLT-11 invoice. An error wrapping
+// lightning.ErrPaymentFailed means
 // the payment definitely failed; any other error leaves the outcome unknown.
 // Cancelling ctx stops waiting but does not stop the payment.
 func (c *Client) SendPayment(ctx context.Context, bolt11 string, maxFeeSat int64) error {
@@ -110,7 +108,7 @@ func (c *Client) SendPayment(ctx context.Context, bolt11 string, maxFeeSat int64
 		case lnrpc.Payment_SUCCEEDED:
 			return nil
 		case lnrpc.Payment_FAILED:
-			return fmt.Errorf("%w: %s", ErrPaymentFailed, payment.FailureReason)
+			return fmt.Errorf("%w: %s", lightning.ErrPaymentFailed, payment.FailureReason)
 		}
 	}
 }
@@ -124,27 +122,12 @@ func (c *Client) Network(ctx context.Context) (*chaincfg.Params, error) {
 	if len(info.Chains) == 0 {
 		return nil, fmt.Errorf("get info: no chain reported")
 	}
-	switch network := info.Chains[0].Network; network {
-	case "mainnet":
-		return &chaincfg.MainNetParams, nil
-	case "testnet":
-		return &chaincfg.TestNet3Params, nil
-	case "testnet4":
-		return &chaincfg.TestNet4Params, nil
-	case "signet":
-		return &chaincfg.SigNetParams, nil
-	case "regtest":
-		return &chaincfg.RegressionNetParams, nil
-	case "simnet":
-		return &chaincfg.SimNetParams, nil
-	default:
-		return nil, fmt.Errorf("unsupported network %q", network)
-	}
+	return lightning.ChainParams(info.Chains[0].Network)
 }
 
-// LastSettleIndex returns the highest settle index on the node, or 0 if no
+// LastPaidIndex returns the highest settle index on the node, or 0 if no
 // invoice has settled.
-func (c *Client) LastSettleIndex(ctx context.Context) (uint64, error) {
+func (c *Client) LastPaidIndex(ctx context.Context) (uint64, error) {
 	invoices, err := c.settledInvoices(ctx)
 	if err != nil || len(invoices) == 0 {
 		return 0, err
@@ -179,15 +162,15 @@ func (c *Client) settledInvoices(ctx context.Context) ([]*lnrpc.Invoice, error) 
 	}
 }
 
-// SubscribeInvoices streams invoices settled after settleIndex to onSettled,
+// SubscribeInvoices streams invoices settled after the settle index after to onSettled,
 // until the stream ends or onSettled returns an error. resumeFrom is a settle
 // index to resubscribe from that loses no invoice not yet passed to onSettled.
-func (c *Client) SubscribeInvoices(ctx context.Context, settleIndex uint64, onSettled func(amountMsat int64, memo string, resumeFrom uint64) error) error {
+func (c *Client) SubscribeInvoices(ctx context.Context, after uint64, onSettled func(amountMsat int64, memo string, resumeFrom uint64) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	stream, err := c.lightning.SubscribeInvoices(ctx, &lnrpc.InvoiceSubscription{
-		SettleIndex: settleIndex,
+		SettleIndex: after,
 	})
 	if err != nil {
 		return fmt.Errorf("subscribe invoices: %w", err)
@@ -199,7 +182,7 @@ func (c *Client) SubscribeInvoices(ctx context.Context, settleIndex uint64, onSe
 	// therefore resume from 0. The stream, opened first, delivers the rest in
 	// settle order, so each of its invoices is a safe point to resume from.
 	listed := map[uint64]bool{}
-	if settleIndex == 0 {
+	if after == 0 {
 		invoices, err := c.settledInvoices(ctx)
 		if err != nil {
 			return err

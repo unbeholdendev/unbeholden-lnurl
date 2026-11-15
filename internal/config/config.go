@@ -15,7 +15,8 @@ import (
 type Config struct {
 	Listen         string                  `yaml:"listen,omitempty"`
 	TrustedProxies []Prefix                `yaml:"trusted_proxies,omitempty"`
-	LND            LNDConfig               `yaml:"lnd"`
+	LND            *LNDConfig              `yaml:"lnd,omitempty"`
+	CLN            *CLNConfig              `yaml:"cln,omitempty"`
 	StateDir       string                  `yaml:"state_dir,omitempty"`
 	Notifications  NotificationsConfig     `yaml:"notifications,omitempty"`
 	WithdrawSecret string                  `yaml:"withdraw_secret,omitempty"`
@@ -45,6 +46,12 @@ type LNDConfig struct {
 	Host     string `yaml:"host"`
 	TLSCert  string `yaml:"tls_cert"`
 	Macaroon string `yaml:"macaroon"`
+}
+
+type CLNConfig struct {
+	URL      string `yaml:"url"`
+	RuneFile string `yaml:"rune_file"`
+	CACert   string `yaml:"ca_cert,omitempty"`
 }
 
 type NotificationsConfig struct {
@@ -123,14 +130,14 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) Validate() error {
-	if c.LND.Host == "" {
-		return fmt.Errorf("lnd.host is required")
+	if (c.LND == nil) == (c.CLN == nil) {
+		return fmt.Errorf("configure one node: lnd or cln")
 	}
-	if c.LND.TLSCert == "" {
-		return fmt.Errorf("lnd.tls_cert is required")
+	if l := c.LND; l != nil && (l.Host == "" || l.TLSCert == "" || l.Macaroon == "") {
+		return fmt.Errorf("lnd needs host, tls_cert and macaroon")
 	}
-	if c.LND.Macaroon == "" {
-		return fmt.Errorf("lnd.macaroon is required")
+	if n := c.CLN; n != nil && (n.URL == "" || n.RuneFile == "") {
+		return fmt.Errorf("cln needs url and rune_file")
 	}
 	if !c.ServesHTTP() && !c.Notifies() {
 		return fmt.Errorf("nothing to do: configure addresses, withdraw or notifications")

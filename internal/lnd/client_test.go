@@ -10,6 +10,8 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"google.golang.org/grpc"
+
+	"unbeholden-lnurl/internal/lightning"
 )
 
 type fakeLightning struct {
@@ -139,7 +141,7 @@ func TestSendPayment_Outcomes(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			err := (&Client{router: tc.router}).SendPayment(context.Background(), "lnbc", 10)
-			if (err != nil) != tc.wantErr || errors.Is(err, ErrPaymentFailed) != tc.wantFailed {
+			if (err != nil) != tc.wantErr || errors.Is(err, lightning.ErrPaymentFailed) != tc.wantFailed {
 				t.Fatalf("err = %v, want error %v, definite failure %v", err, tc.wantErr, tc.wantFailed)
 			}
 		})

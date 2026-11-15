@@ -2,7 +2,6 @@ package lnurl
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -16,7 +15,9 @@ const maxCommentLen = 140
 
 // Invoicer creates invoices.
 type Invoicer interface {
-	AddInvoice(ctx context.Context, amountMsat int64, descriptionHash []byte, memo string) (string, error)
+	// AddInvoice creates an invoice for amountMsat that commits to the
+	// hash of description, with memo kept on the node.
+	AddInvoice(ctx context.Context, amountMsat int64, description, memo string) (string, error)
 }
 
 // AddressHandler handles Lightning Address (LUD-16) requests.
@@ -104,8 +105,7 @@ func (h *AddressHandler) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	descHash := sha256.Sum256([]byte(addressMetadata(addr.Description, username, r.Host)))
-	bolt11, err := h.invoicer.AddInvoice(r.Context(), amountMsat, descHash[:], comment)
+	bolt11, err := h.invoicer.AddInvoice(r.Context(), amountMsat, addressMetadata(addr.Description, username, r.Host), comment)
 	if err != nil {
 		slog.Error("add invoice failed", "username", username, "err", err)
 		writeError(w, "failed to create invoice")
