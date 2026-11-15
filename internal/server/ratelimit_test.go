@@ -113,3 +113,25 @@ func TestRateLimiter_PrunesRefilledVisitors(t *testing.T) {
 		t.Fatal("pruning reset a visitor whose bucket had not refilled")
 	}
 }
+
+func TestRateLimiter_IPv6Prefix(t *testing.T) {
+	rl := newRateLimiter(0, 1)
+	for _, tc := range []struct {
+		ip   string
+		want bool
+	}{
+		{"2001:db8:1:2::1", true},
+		{"2001:db8:1:2::ffff", false},
+		{"2001:0db8:0001:0002::2", false},
+		{"2001:db8:1:3::1", true},
+		{"192.0.2.1", true},
+		{"::ffff:192.0.2.1", false},
+		{"192.0.2.2", true},
+		{"unparsable", true},
+		{"unparsable", false},
+	} {
+		if got := rl.allow(tc.ip); got != tc.want {
+			t.Errorf("allow(%q) = %v, want %v", tc.ip, got, tc.want)
+		}
+	}
+}

@@ -5,10 +5,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -187,7 +189,7 @@ func (f lookupInvoices) LookupInvoice(_ context.Context, hash []byte) (lightning
 	return invoice, nil
 }
 
-func TestPrune_DeletesOnlyOldExpiredUnpaidRequests(t *testing.T) {
+func TestPrune_DeletesExpiredUnpaidRequests(t *testing.T) {
 	z, _ := newZapper(t)
 	old := time.Now().Add(-9 * 24 * time.Hour)
 	for _, hash := range []string{"expired", "paid", "open", "unknown", "recent"} {
@@ -207,12 +209,96 @@ func TestPrune_DeletesOnlyOldExpiredUnpaidRequests(t *testing.T) {
 	z.Prune(context.Background(), invoices)
 	for _, hash := range []string{"expired", "paid", "open", "unknown", "recent"} {
 		_, err := os.Stat(z.path([]byte(hash)))
-		if hash == "expired" {
+		if hash == "expired" || hash == "recent" {
 			if !os.IsNotExist(err) {
 				t.Fatalf("expired request kept: %v", err)
 			}
 		} else if err != nil {
 			t.Fatalf("%s request lost: %v", hash, err)
 		}
+	}
+}
+
+func TestPendingLimit(t *testing.T) {
+	z, _ := newZapper(t)
+	if err := os.MkdirAll(z.dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4096; i++ {
+		if err := os.WriteFile(filepath.Join(z.dir, fmt.Sprintf("%064x", i)), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw := request(t, recipient, relays)
+	if _, err := z.Request(raw, 1000); err == nil {
+		t.Error("full store accepted request")
+	}
+	if err := z.Track([]byte("new"), raw); err == nil {
+		t.Error("full store tracked request")
+	}
+	if err := os.Remove(filepath.Join(z.dir, fmt.Sprintf("%064x", 0))); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.Track([]byte("new"), raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.Track([]byte("new"), raw); err != nil {
+		t.Fatal("replacement:", err)
+	}
+	if err := z.Track([]byte("large"), strings.Repeat("x", (16<<10)+1)); err == nil {
+		t.Error("oversized request tracked")
+	}
+}
+
+func TestTrack_ConcurrentLimit(t *testing.T) {
+	z, _ := newZapper(t)
+	if err := os.MkdirAll(z.dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxPendingRequests-1; i++ {
+		if err := os.WriteFile(filepath.Join(z.dir, fmt.Sprintf("%064x", i)), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var wg sync.WaitGroup
+	results := make(chan error, 8)
+	for i := range 8 {
+		wg.Go(func() { results <- z.Track([]byte(fmt.Sprintf("concurrent%d", i)), "request") })
+	}
+	wg.Wait()
+	close(results)
+	accepted := 0
+	for err := range results {
+		if err == nil {
+			accepted++
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("accepted %d requests with one slot left", accepted)
+	}
+}
+
+type missingInvoices struct{}
+
+func (missingInvoices) LookupInvoice(context.Context, []byte) (lightning.Invoice, error) {
+	return lightning.Invoice{}, fmt.Errorf("lookup: %w", lightning.ErrInvoiceNotFound)
+}
+func TestPruneMissingInvoices(t *testing.T) {
+	z, _ := newZapper(t)
+	for _, hash := range []string{"old", "recent"} {
+		if err := z.Track([]byte(hash), "request"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-9 * 24 * time.Hour)
+	if err := os.Chtimes(z.path([]byte("old")), old, old); err != nil {
+		t.Fatal(err)
+	}
+	z.Prune(context.Background(), missingInvoices{})
+	if _, err := os.Stat(z.path([]byte("old"))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old missing invoice kept: %v", err)
+	}
+	if _, err := os.Stat(z.path([]byte("recent"))); err != nil {
+		t.Fatal("recent request lost:", err)
 	}
 }

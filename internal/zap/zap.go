@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"unbeholden-lnurl/internal/atomicfile"
@@ -26,8 +27,9 @@ const (
 	requestKind = 9734
 	receiptKind = 9735
 
-	maxRequestLen = 16 << 10
-	maxRelays     = 20
+	maxRequestLen      = 16 << 10
+	maxRelays          = 20
+	maxPendingRequests = 4096
 )
 
 // Publisher sends events to relays and returns how many accepted them.
@@ -40,6 +42,7 @@ type Zapper struct {
 	key       nostr.Key
 	publisher Publisher
 	dir       string
+	mu        sync.Mutex
 }
 
 // New returns a Zapper signing receipts with key and keeping zap requests
@@ -57,6 +60,12 @@ func (z *Zapper) PubKey() string {
 // requires, and returns it.
 func (z *Zapper) Request(raw string, amountMsat int64) (nostr.Event, error) {
 	var e nostr.Event
+	z.mu.Lock()
+	err := z.checkCapacity()
+	z.mu.Unlock()
+	if err != nil {
+		return e, err
+	}
 	if len(raw) > maxRequestLen {
 		return e, errors.New("zap request too long")
 	}
@@ -106,7 +115,33 @@ func isCoordinate(s string) bool {
 // Track keeps raw, a zap request checked by Request, until the invoice with
 // paymentHash is paid.
 func (z *Zapper) Track(paymentHash []byte, raw string) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	if len(raw) > maxRequestLen {
+		return errors.New("zap request too long")
+	}
+	if _, err := os.Stat(z.path(paymentHash)); errors.Is(err, fs.ErrNotExist) {
+		if err := z.checkCapacity(); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
 	return atomicfile.Write(z.path(paymentHash), []byte(raw))
+}
+
+func (z *Zapper) checkCapacity() error {
+	entries, err := os.ReadDir(z.dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if len(entries) >= maxPendingRequests {
+		return errors.New("pending zap request limit reached")
+	}
+	return nil
 }
 
 // Settled publishes the zap receipt for invoice, if it was issued for a zap
@@ -171,8 +206,8 @@ type Invoices interface {
 	LookupInvoice(context.Context, []byte) (lightning.Invoice, error)
 }
 
-// Prune removes old requests only when the node confirms expiry without payment.
-// Requests with unknown outcomes remain available for settlement recovery.
+// Prune removes expired unpaid requests and requests missing from the node
+// after eight days. Other outcomes remain available for settlement recovery.
 func (z *Zapper) Prune(ctx context.Context, invoices Invoices) {
 	entries, err := os.ReadDir(z.dir)
 	if err != nil {
@@ -186,7 +221,7 @@ func (z *Zapper) Prune(ctx context.Context, invoices Invoices) {
 			return
 		}
 		info, err := entry.Info()
-		if err != nil || !info.Mode().IsRegular() || time.Since(info.ModTime()) < 8*24*time.Hour {
+		if err != nil || !info.Mode().IsRegular() {
 			continue
 		}
 		hash, err := hex.DecodeString(entry.Name())
@@ -194,11 +229,15 @@ func (z *Zapper) Prune(ctx context.Context, invoices Invoices) {
 			continue
 		}
 		invoice, err := invoices.LookupInvoice(ctx, hash)
-		if err != nil {
+		if errors.Is(err, lightning.ErrInvoiceNotFound) {
+			if time.Since(info.ModTime()) < 8*24*time.Hour {
+				continue
+			}
+		} else if err != nil {
 			slog.Warn("check pending zap", "hash", entry.Name(), "err", err)
 			continue
 		}
-		if !invoice.Expired || invoice.Settled {
+		if err == nil && (!invoice.Expired || invoice.Settled) {
 			continue
 		}
 		if err := os.Remove(filepath.Join(z.dir, entry.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {

@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -31,6 +32,14 @@ func newRateLimiter(rps float64, burst int) *rateLimiter {
 // as a new one would start the same, so it takes the token under the same
 // lock as pruning.
 func (rl *rateLimiter) allow(ip string) bool {
+	if addr, err := netip.ParseAddr(ip); err == nil {
+		addr = addr.Unmap()
+		if addr.Is6() {
+			ip = netip.PrefixFrom(addr.WithZone(""), 64).Masked().String()
+		} else {
+			ip = addr.String()
+		}
+	}
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
