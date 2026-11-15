@@ -34,6 +34,8 @@ type fakeNode struct {
 	notified []string
 	invoices map[string]lightning.Invoice
 	last     string
+	// description and memo are those of the last invoice added.
+	description, memo string
 }
 
 func (f *fakeNode) SendPayment(ctx context.Context, _ string, _ int64) error {
@@ -46,9 +48,10 @@ func (f *fakeNode) SendPayment(ctx context.Context, _ string, _ int64) error {
 	return nil
 }
 
-func (f *fakeNode) AddInvoice(_ context.Context, amountMsat int64, _, memo string) (lightning.Invoice, error) {
+func (f *fakeNode) AddInvoice(_ context.Context, amountMsat int64, description, memo string) (lightning.Invoice, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.description, f.memo = description, memo
 	if f.invoices == nil {
 		f.invoices = map[string]lightning.Invoice{}
 	}

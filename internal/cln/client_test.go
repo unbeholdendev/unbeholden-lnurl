@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -165,17 +166,19 @@ func TestInvoices_MemoRoundTripsThroughLabel(t *testing.T) {
 
 func TestSubscribeInvoices_FollowsPayIndexAcrossTimeouts(t *testing.T) {
 	paid := func(index int) reply {
-		return ok(map[string]any{"pay_index": index, "amount_received_msat": 1000 * index, "label": "l", "description": "d"})
+		return ok(map[string]any{"pay_index": index, "amount_received_msat": 1000 * index, "label": "l", "description": "d",
+			"payment_hash": "ab", "bolt11": "lnbc1", "payment_preimage": "cd", "paid_at": 1700000000 + index})
 	}
 	errStop := errors.New("stop")
 	f, c := newFakeNode(t, map[string][]reply{
 		"waitanyinvoice": {paid(4), rpcFail(904, "Timed out"), paid(5)},
 	})
 	var got []uint64
-	err := c.SubscribeInvoices(context.Background(), 3, func(amountMsat int64, memo string, resume uint64) error {
+	err := c.SubscribeInvoices(context.Background(), 3, func(inv lightning.Settled, resume uint64) error {
 		got = append(got, resume)
-		if amountMsat != 1000*int64(resume) || memo != "d" {
-			t.Errorf("invoice %d: amount %d, memo %q", resume, amountMsat, memo)
+		want := lightning.Settled{AmountMsat: 1000 * int64(resume), Memo: "d", PaymentHash: []byte{0xab}, PaymentRequest: "lnbc1", Preimage: []byte{0xcd}, SettledAt: time.Unix(1700000000+int64(resume), 0)}
+		if !reflect.DeepEqual(inv, want) {
+			t.Errorf("invoice %d = %+v, want %+v", resume, inv, want)
 		}
 		if resume == 5 {
 			return errStop
@@ -210,20 +213,25 @@ func TestLookupInvoice(t *testing.T) {
 	f, c := newFakeNode(t, map[string][]reply{"listinvoices": {
 		ok(map[string]any{"invoices": []map[string]string{{"bolt11": "lnbc1", "status": "unpaid"}}}),
 		ok(map[string]any{"invoices": []map[string]string{{"bolt11": "lnbc1", "status": "paid", "payment_preimage": "beef"}}}),
+		ok(map[string]any{"invoices": []map[string]string{{"status": "expired"}}}),
 		ok(map[string]any{"invoices": []any{}}),
 	}})
 	ctx := context.Background()
 
 	unpaid, err := c.LookupInvoice(ctx, []byte{0xab})
-	if err != nil || unpaid.Settled || unpaid.Preimage != nil || unpaid.PaymentRequest != "lnbc1" {
+	if err != nil || unpaid.Expired || unpaid.Settled || unpaid.Preimage != nil || unpaid.PaymentRequest != "lnbc1" {
 		t.Fatalf("unpaid = %+v, %v", unpaid, err)
 	}
 	if f.calls[0]["payment_hash"] != "ab" {
 		t.Fatalf("listinvoices params = %v", f.calls[0])
 	}
 	paid, err := c.LookupInvoice(ctx, []byte{0xab})
-	if err != nil || !paid.Settled || string(paid.Preimage) != "\xbe\xef" {
+	if err != nil || paid.Expired || !paid.Settled || string(paid.Preimage) != "\xbe\xef" {
 		t.Fatalf("paid = %+v, %v", paid, err)
+	}
+	expired, err := c.LookupInvoice(ctx, []byte{0xab})
+	if err != nil || !expired.Expired || expired.Settled {
+		t.Fatalf("expired = %+v, %v", expired, err)
 	}
 	if _, err := c.LookupInvoice(ctx, []byte{0xab}); !errors.Is(err, lightning.ErrInvoiceNotFound) {
 		t.Fatalf("missing: err = %v, want ErrInvoiceNotFound", err)

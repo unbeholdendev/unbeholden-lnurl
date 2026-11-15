@@ -5,10 +5,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"unbeholden-lnurl/internal/config"
+	"unbeholden-lnurl/internal/nostr"
+	"unbeholden-lnurl/internal/zap"
 )
 
 var testVerifyKey = []byte("verify key")
@@ -92,7 +98,7 @@ func TestAddressMetadata_LongDescriptionAndImage(t *testing.T) {
 func TestHandleWellKnown_DomainFromHost(t *testing.T) {
 	h := NewAddressHandler(map[string]config.AddressEntry{
 		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
-	}, nil, nil, testVerifyKey)
+	}, nil, nil, testVerifyKey, nil)
 
 	req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob", nil)
 	req.SetPathValue("username", "bob")
@@ -115,7 +121,7 @@ func TestHandleInvoice(t *testing.T) {
 	node := &fakeNode{}
 	h := NewAddressHandler(map[string]config.AddressEntry{
 		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
-	}, node, node, testVerifyKey)
+	}, node, node, testVerifyKey, nil)
 
 	get := func(query string) map[string]any {
 		req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob/invoice?"+query, nil)
@@ -153,7 +159,7 @@ func TestHandleInvoice(t *testing.T) {
 func TestHandleInvoice_WithoutNotifier(t *testing.T) {
 	h := NewAddressHandler(map[string]config.AddressEntry{
 		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
-	}, &fakeNode{}, nil, testVerifyKey)
+	}, &fakeNode{}, nil, testVerifyKey, nil)
 	req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob/invoice?amount=1500", nil)
 	req.SetPathValue("username", "bob")
 	rec := httptest.NewRecorder()
@@ -166,7 +172,7 @@ func TestHandleInvoice_WithoutNotifier(t *testing.T) {
 func TestHandleInvoice_SuccessMessage(t *testing.T) {
 	h := NewAddressHandler(map[string]config.AddressEntry{
 		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000, SuccessMessage: "Thanks!"},
-	}, &fakeNode{}, nil, testVerifyKey)
+	}, &fakeNode{}, nil, testVerifyKey, nil)
 	req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob/invoice?amount=1500", nil)
 	req.SetPathValue("username", "bob")
 	rec := httptest.NewRecorder()
@@ -180,7 +186,7 @@ func TestHandleVerify(t *testing.T) {
 	node := &fakeNode{}
 	h := NewAddressHandler(map[string]config.AddressEntry{
 		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
-	}, node, nil, testVerifyKey)
+	}, node, nil, testVerifyKey, nil)
 
 	call := func(handler http.HandlerFunc, path, username, token string) map[string]any {
 		t.Helper()
@@ -232,7 +238,7 @@ func TestHandleVerify(t *testing.T) {
 func TestHandleVerify_AfterMetadataChange(t *testing.T) {
 	node := &fakeNode{}
 	entry := config.AddressEntry{Description: "before", MinSendable: 1000, MaxSendable: 2000}
-	before := NewAddressHandler(map[string]config.AddressEntry{"*": entry}, node, nil, testVerifyKey)
+	before := NewAddressHandler(map[string]config.AddressEntry{"*": entry}, node, nil, testVerifyKey, nil)
 	req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob/invoice?amount=1500", nil)
 	req.SetPathValue("username", "bob")
 	rec := httptest.NewRecorder()
@@ -244,7 +250,7 @@ func TestHandleVerify_AfterMetadataChange(t *testing.T) {
 	node.settle(node.lastHash(), []byte{1})
 
 	entry.Description = "after"
-	after := NewAddressHandler(map[string]config.AddressEntry{"*": entry}, node, nil, testVerifyKey)
+	after := NewAddressHandler(map[string]config.AddressEntry{"*": entry}, node, nil, testVerifyKey, nil)
 	req = httptest.NewRequest("GET", issued["verify"].(string), nil)
 	req.SetPathValue("username", "bob")
 	req.SetPathValue("token", strings.TrimPrefix(issued["verify"].(string), "https://shop.example.com/.well-known/lnurlp/bob/verify/"))
@@ -252,5 +258,85 @@ func TestHandleVerify_AfterMetadataChange(t *testing.T) {
 	after.HandleVerify(rec, req)
 	if !strings.Contains(rec.Body.String(), `"settled":true`) {
 		t.Fatalf("verify after metadata change = %s", rec.Body.String())
+	}
+}
+
+func zapRequest(t *testing.T, content string, amountMsat int64) string {
+	t.Helper()
+	sender, err := nostr.ParseKey(strings.Repeat("02", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := nostr.Event{CreatedAt: 1700000000, Kind: 9734, Content: content, Tags: [][]string{
+		{"p", strings.Repeat("ab", 32)},
+		{"relays", "wss://relay.example"},
+		{"amount", strconv.FormatInt(amountMsat, 10)},
+	}}
+	if err := sender.Sign(&e); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func TestZaps(t *testing.T) {
+	key, err := nostr.ParseKey(strings.Repeat("01", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	zapper := zap.New(key, nil, dir)
+	node := &fakeNode{}
+	addresses := map[string]config.AddressEntry{"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000}}
+	h := NewAddressHandler(addresses, node, nil, testVerifyKey, zapper)
+
+	get := func(h *AddressHandler, handler func(*AddressHandler) http.HandlerFunc, query string) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob?"+query, nil)
+		req.SetPathValue("username", "bob")
+		rec := httptest.NewRecorder()
+		handler(h)(rec, req)
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	wellKnown := func(h *AddressHandler) http.HandlerFunc { return h.HandleWellKnown }
+	invoice := func(h *AddressHandler) http.HandlerFunc { return h.HandleInvoice }
+
+	if resp := get(h, wellKnown, ""); resp["allowsNostr"] != true || resp["nostrPubkey"] != key.PubKey() {
+		t.Fatalf("payRequest = %v", resp)
+	}
+
+	long := strings.Repeat("é", maxCommentLen)
+	raw := zapRequest(t, long, 1500)
+	if resp := get(h, invoice, "amount=1500&nostr="+url.QueryEscape(raw)); resp["pr"] == nil {
+		t.Fatalf("zap invoice: %v", resp)
+	}
+	if node.description != raw {
+		t.Fatalf("invoice description = %q, want the zap request", node.description)
+	}
+	if node.memo != long[:maxCommentLen] {
+		t.Fatalf("memo = %q, want the content cut to %d bytes", node.memo, maxCommentLen)
+	}
+	if stored, err := os.ReadFile(filepath.Join(dir, node.lastHash())); err != nil || string(stored) != raw {
+		t.Fatalf("stored zap request = %q, %v", stored, err)
+	}
+
+	if resp := get(h, invoice, "amount=1000&nostr="+url.QueryEscape(raw)); resp["status"] != "ERROR" {
+		t.Fatalf("zap with wrong amount: %v", resp)
+	}
+
+	off := NewAddressHandler(addresses, node, nil, testVerifyKey, nil)
+	if resp := get(off, wellKnown, ""); resp["allowsNostr"] != nil || resp["nostrPubkey"] != nil {
+		t.Fatalf("payRequest without zaps = %v", resp)
+	}
+	get(off, invoice, "amount=1500&nostr="+url.QueryEscape(raw))
+	if !strings.HasPrefix(node.description, `[["text/plain"`) {
+		t.Fatalf("description without zaps = %q, want the metadata", node.description)
 	}
 }

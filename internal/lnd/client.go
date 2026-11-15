@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
@@ -100,6 +101,7 @@ func (c *Client) LookupInvoice(ctx context.Context, paymentHash []byte) (lightni
 		PaymentRequest: resp.PaymentRequest,
 		PaymentHash:    resp.RHash,
 		Settled:        resp.State == lnrpc.Invoice_SETTLED,
+		Expired:        resp.State == lnrpc.Invoice_CANCELED,
 	}
 	if invoice.Settled {
 		invoice.Preimage = resp.RPreimage
@@ -188,7 +190,7 @@ func (c *Client) settledInvoices(ctx context.Context) ([]*lnrpc.Invoice, error) 
 // SubscribeInvoices streams invoices settled after the settle index after to onSettled,
 // until the stream ends or onSettled returns an error. resumeFrom is a settle
 // index to resubscribe from that loses no invoice not yet passed to onSettled.
-func (c *Client) SubscribeInvoices(ctx context.Context, after uint64, onSettled func(amountMsat int64, memo string, resumeFrom uint64) error) error {
+func (c *Client) SubscribeInvoices(ctx context.Context, after uint64, onSettled func(invoice lightning.Settled, resumeFrom uint64) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -212,7 +214,7 @@ func (c *Client) SubscribeInvoices(ctx context.Context, after uint64, onSettled 
 		}
 		for _, invoice := range invoices {
 			listed[invoice.SettleIndex] = true
-			if err := onSettled(invoice.AmtPaidMsat, invoice.Memo, 0); err != nil {
+			if err := onSettled(toSettled(invoice), 0); err != nil {
 				return err
 			}
 		}
@@ -226,9 +228,20 @@ func (c *Client) SubscribeInvoices(ctx context.Context, after uint64, onSettled 
 		if invoice.State != lnrpc.Invoice_SETTLED || listed[invoice.SettleIndex] {
 			continue
 		}
-		if err := onSettled(invoice.AmtPaidMsat, invoice.Memo, invoice.SettleIndex); err != nil {
+		if err := onSettled(toSettled(invoice), invoice.SettleIndex); err != nil {
 			return err
 		}
+	}
+}
+
+func toSettled(invoice *lnrpc.Invoice) lightning.Settled {
+	return lightning.Settled{
+		AmountMsat:     invoice.AmtPaidMsat,
+		Memo:           invoice.Memo,
+		PaymentHash:    invoice.RHash,
+		PaymentRequest: invoice.PaymentRequest,
+		Preimage:       invoice.RPreimage,
+		SettledAt:      time.Unix(invoice.SettleDate, 0),
 	}
 }
 

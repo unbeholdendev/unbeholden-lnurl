@@ -11,9 +11,11 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"unicode/utf8"
 
 	"unbeholden-lnurl/internal/config"
 	"unbeholden-lnurl/internal/lightning"
+	"unbeholden-lnurl/internal/nostr"
 )
 
 const maxCommentLen = 140
@@ -27,12 +29,20 @@ type Invoicer interface {
 	LookupInvoice(ctx context.Context, paymentHash []byte) (lightning.Invoice, error)
 }
 
+// Zapper checks zap requests (NIP-57) and keeps them until paid.
+type Zapper interface {
+	PubKey() string
+	Request(raw string, amountMsat int64) (nostr.Event, error)
+	Track(paymentHash []byte, raw string) error
+}
+
 // AddressHandler handles Lightning Address (LUD-16) requests.
 type AddressHandler struct {
 	addresses map[string]config.AddressEntry
 	invoicer  Invoicer
 	ntfy      Notifier
 	verifyKey []byte
+	zapper    Zapper
 }
 
 type payRequest struct {
@@ -42,6 +52,8 @@ type payRequest struct {
 	MinSendable    int64  `json:"minSendable"`
 	MaxSendable    int64  `json:"maxSendable"`
 	CommentAllowed int    `json:"commentAllowed"`
+	AllowsNostr    bool   `json:"allowsNostr,omitempty"`
+	NostrPubkey    string `json:"nostrPubkey,omitempty"`
 }
 
 type invoiceResponse struct {
@@ -67,9 +79,9 @@ type verifyResponse struct {
 // NewAddressHandler creates an AddressHandler. The "*" entry, if present,
 // serves every username without an entry of its own. A nil ntfy sends no
 // notifications. verifyKey signs verify URLs, so changing it breaks those
-// already issued.
-func NewAddressHandler(addresses map[string]config.AddressEntry, invoicer Invoicer, ntfy Notifier, verifyKey []byte) *AddressHandler {
-	return &AddressHandler{addresses: addresses, invoicer: invoicer, ntfy: ntfy, verifyKey: verifyKey}
+// already issued. A nil zapper turns zaps off.
+func NewAddressHandler(addresses map[string]config.AddressEntry, invoicer Invoicer, ntfy Notifier, verifyKey []byte, zapper Zapper) *AddressHandler {
+	return &AddressHandler{addresses: addresses, invoicer: invoicer, ntfy: ntfy, verifyKey: verifyKey, zapper: zapper}
 }
 
 func (h *AddressHandler) resolveAddress(username string) (config.AddressEntry, bool) {
@@ -89,14 +101,19 @@ func (h *AddressHandler) HandleWellKnown(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	writeJSON(w, payRequest{
+	resp := payRequest{
 		Tag:            "payRequest",
 		Callback:       fmt.Sprintf("https://%s/.well-known/lnurlp/%s/invoice", r.Host, username),
 		Metadata:       addressMetadata(addr, username, r.Host),
 		MinSendable:    addr.MinSendable,
 		MaxSendable:    addr.MaxSendable,
 		CommentAllowed: maxCommentLen,
-	})
+	}
+	if h.zapper != nil {
+		resp.AllowsNostr = true
+		resp.NostrPubkey = h.zapper.PubKey()
+	}
+	writeJSON(w, resp)
 }
 
 // HandleInvoice handles GET /.well-known/lnurlp/{username}/invoice?amount=X.
@@ -129,11 +146,34 @@ func (h *AddressHandler) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	invoice, err := h.invoicer.AddInvoice(r.Context(), amountMsat, addressMetadata(addr, username, r.Host), comment)
+	// A zap's invoice commits to the zap request instead of the metadata.
+	description := addressMetadata(addr, username, r.Host)
+	zapRequest := r.URL.Query().Get("nostr")
+	if h.zapper == nil {
+		zapRequest = ""
+	}
+	if zapRequest != "" {
+		request, err := h.zapper.Request(zapRequest, amountMsat)
+		if err != nil {
+			writeError(w, err.Error())
+			return
+		}
+		description = zapRequest
+		comment = truncate(request.Content, maxCommentLen)
+	}
+
+	invoice, err := h.invoicer.AddInvoice(r.Context(), amountMsat, description, comment)
 	if err != nil {
 		slog.Error("add invoice failed", "username", username, "err", err)
 		writeError(w, "failed to create invoice")
 		return
+	}
+	if zapRequest != "" {
+		if err := h.zapper.Track(invoice.PaymentHash, zapRequest); err != nil {
+			slog.Error("store zap request failed", "username", username, "err", err)
+			writeError(w, "failed to create invoice")
+			return
+		}
 	}
 
 	address := fmt.Sprintf("%s@%s", username, r.Host)
@@ -191,6 +231,17 @@ func (h *AddressHandler) verifyToken(username string, paymentHash []byte) []byte
 	mac.Write(paymentHash)
 	mac.Write([]byte(username))
 	return mac.Sum(append([]byte{}, paymentHash...))[:sha256.Size+16]
+}
+
+// truncate cuts s to at most n bytes without splitting a character.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 func addressMetadata(addr config.AddressEntry, username, host string) string {

@@ -19,10 +19,13 @@ import (
 
 	"unbeholden-lnurl/internal/cln"
 	"unbeholden-lnurl/internal/config"
+	"unbeholden-lnurl/internal/lightning"
 	"unbeholden-lnurl/internal/lnd"
 	"unbeholden-lnurl/internal/lnurl"
+	"unbeholden-lnurl/internal/nostr"
 	"unbeholden-lnurl/internal/notifier"
 	"unbeholden-lnurl/internal/server"
+	"unbeholden-lnurl/internal/zap"
 )
 
 const shutdownTimeout = lnurl.PayTimeout + 10*time.Second
@@ -110,9 +113,24 @@ func run(ctx context.Context, cfg *config.Config) error {
 		notify = ntfy
 	}
 
+	var zapper *zap.Zapper
+	if n := cfg.Nostr; n != nil {
+		key, err := nostr.ParseKey(n.PrivateKey)
+		if err != nil {
+			return fmt.Errorf("nostr.private_key_file: %w", err)
+		}
+		zapper = zap.New(key, nostr.NewPublisher(), filepath.Join(cfg.StateDir, "zaps"))
+		slog.Info("zaps enabled", "nostr_pubkey", zapper.PubKey())
+	}
+
+	if ntfy != nil || zapper != nil {
+		if err := notifier.InitSettled(ctx, node, filepath.Join(cfg.StateDir, "settle_index")); err != nil {
+			return fmt.Errorf("initialise settlement tracking: %w", err)
+		}
+	}
 	g, ctx := errgroup.WithContext(ctx)
 	if cfg.ServesHTTP() {
-		srv, err := newServer(ctx, cfg, node, notify)
+		srv, err := newServer(ctx, cfg, node, notify, zapper)
 		if err != nil {
 			return err
 		}
@@ -123,18 +141,43 @@ func run(ctx context.Context, cfg *config.Config) error {
 		slog.Info("listening", "addr", ln.Addr().String())
 		g.Go(func() error { return serve(ctx, srv, ln) })
 	}
-	if ntfy != nil {
+	if zapper != nil {
+		g.Go(func() error {
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for {
+				zapper.Prune(ctx, node)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-ticker.C:
+				}
+			}
+		})
+	}
+	if ntfy != nil || zapper != nil {
+		onSettled := func(invoice lightning.Settled) error {
+			if zapper != nil {
+				if err := zapper.Settled(ctx, invoice); err != nil {
+					return err
+				}
+			}
+			if ntfy != nil {
+				return ntfy.NotifyPayment(invoice)
+			}
+			return nil
+		}
 		g.Go(func() error {
 			// Named before Core Lightning support; a new name would lose the
 			// position of existing deployments.
-			notifier.WatchSettled(ctx, node, filepath.Join(cfg.StateDir, "settle_index"), ntfy)
+			notifier.WatchSettled(ctx, node, filepath.Join(cfg.StateDir, "settle_index"), onSettled)
 			return nil
 		})
 	}
 	return g.Wait()
 }
 
-func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.Notifier) (*http.Server, error) {
+func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.Notifier, zapper *zap.Zapper) (*http.Server, error) {
 	var withdrawHandler *lnurl.WithdrawHandler
 	if len(cfg.Withdraw) > 0 {
 		network, err := node.Network(ctx)
@@ -164,7 +207,12 @@ func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.
 		if err != nil {
 			return nil, err
 		}
-		addressHandler = lnurl.NewAddressHandler(cfg.Addresses, node, notify, verifyKey)
+		// Kept apart from zapper: a nil *Zapper in an interface is not a nil Zapper.
+		var zaps lnurl.Zapper
+		if zapper != nil {
+			zaps = zapper
+		}
+		addressHandler = lnurl.NewAddressHandler(cfg.Addresses, node, notify, verifyKey, zaps)
 	}
 	return server.New(cfg.TrustedProxies, cfg.RateLimit, withdrawHandler, addressHandler), nil
 }

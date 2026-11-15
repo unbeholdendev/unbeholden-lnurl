@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"unbeholden-lnurl/internal/config"
+	"unbeholden-lnurl/internal/lightning"
 )
 
 type fakeInvoices struct {
@@ -23,13 +24,13 @@ func (f *fakeInvoices) LastPaidIndex(context.Context) (uint64, error) {
 	return f.lastPaidIndex, nil
 }
 
-func (f *fakeInvoices) SubscribeInvoices(ctx context.Context, after uint64, onSettled func(int64, string, uint64) error) error {
+func (f *fakeInvoices) SubscribeInvoices(ctx context.Context, after uint64, onSettled func(lightning.Settled, uint64) error) error {
 	f.from = append(f.from, after)
 	for _, i := range f.settled {
 		if i <= after {
 			continue
 		}
-		if err := onSettled(1000*int64(i), "", i); err != nil {
+		if err := onSettled(lightning.Settled{AmountMsat: 1000 * int64(i)}, i); err != nil {
 			return err
 		}
 	}
@@ -44,7 +45,7 @@ func (f *fakeInvoices) watch(t *testing.T, statePath string, n *Ntfy) {
 	ctx, cancel := context.WithCancel(context.Background())
 	f.cancel = cancel
 	f.from = nil
-	WatchSettled(ctx, f, statePath, n)
+	WatchSettled(ctx, f, statePath, n.NotifyPayment)
 }
 
 func ntfyServer(t *testing.T, fail func(body string) bool) (*Ntfy, *[]string) {
@@ -103,5 +104,23 @@ func TestWatchSettled_RetriesFailedDelivery(t *testing.T) {
 	}
 	if got := *delivered; len(got) != 3 || got[1] != "Received 2 sats" || got[2] != "Received 3 sats" {
 		t.Fatalf("delivered = %q", got)
+	}
+}
+
+func TestInitSettled_RecordsBaselineBeforeNewPayments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settle_index")
+	f := &fakeInvoices{lastPaidIndex: 7}
+	if err := InitSettled(context.Background(), f, path); err != nil {
+		t.Fatal(err)
+	}
+	f.lastPaidIndex = 8
+	f.settled = []uint64{8}
+	if err := InitSettled(context.Background(), f, path); err != nil {
+		t.Fatal(err)
+	}
+	var delivered int
+	watchOnce(context.Background(), f, path, func(lightning.Settled) error { delivered++; return nil })
+	if delivered != 1 {
+		t.Fatalf("delivered %d payments, want 1", delivered)
 	}
 }

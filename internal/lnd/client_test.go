@@ -61,7 +61,7 @@ func (s *fakeStream) Recv() (*lnrpc.Invoice, error) {
 }
 
 func settled(index uint64) *lnrpc.Invoice {
-	return &lnrpc.Invoice{State: lnrpc.Invoice_SETTLED, SettleIndex: index, AmtPaidMsat: int64(index)}
+	return &lnrpc.Invoice{State: lnrpc.Invoice_SETTLED, SettleIndex: index, AmtPaidMsat: int64(index), RHash: []byte{byte(index)}, SettleDate: int64(index)}
 }
 
 type delivery struct{ amountMsat, resume uint64 }
@@ -69,8 +69,11 @@ type delivery struct{ amountMsat, resume uint64 }
 func collect(t *testing.T, f *fakeLightning, from uint64) []delivery {
 	t.Helper()
 	var got []delivery
-	(&Client{lightning: f}).SubscribeInvoices(context.Background(), from, func(amountMsat int64, _ string, resume uint64) error {
-		got = append(got, delivery{uint64(amountMsat), resume})
+	(&Client{lightning: f}).SubscribeInvoices(context.Background(), from, func(invoice lightning.Settled, resume uint64) error {
+		if invoice.PaymentHash[0] != byte(invoice.AmountMsat) || invoice.SettledAt.Unix() != invoice.AmountMsat {
+			t.Errorf("invoice %d: hash %x, settled at %v", invoice.AmountMsat, invoice.PaymentHash, invoice.SettledAt)
+		}
+		got = append(got, delivery{uint64(invoice.AmountMsat), resume})
 		return nil
 	})
 	return got
@@ -104,7 +107,7 @@ func TestSubscribeInvoices_CallbackErrorCancelsStream(t *testing.T) {
 	c := &Client{lightning: f}
 
 	errStop := errors.New("stop")
-	err := c.SubscribeInvoices(context.Background(), 3, func(int64, string, uint64) error { return errStop })
+	err := c.SubscribeInvoices(context.Background(), 3, func(lightning.Settled, uint64) error { return errStop })
 	if !errors.Is(err, errStop) {
 		t.Fatalf("err = %v, want %v", err, errStop)
 	}
@@ -177,18 +180,23 @@ func TestNetwork(t *testing.T) {
 
 func TestLookupInvoice(t *testing.T) {
 	c := &Client{lightning: &fakeLightning{lookup: map[string]*lnrpc.Invoice{
-		"open":    {PaymentRequest: "lnbc1", RPreimage: []byte("secret"), State: lnrpc.Invoice_OPEN},
-		"settled": {PaymentRequest: "lnbc2", RPreimage: []byte("secret"), State: lnrpc.Invoice_SETTLED},
+		"canceled": {State: lnrpc.Invoice_CANCELED},
+		"open":     {PaymentRequest: "lnbc1", RPreimage: []byte("secret"), State: lnrpc.Invoice_OPEN},
+		"settled":  {PaymentRequest: "lnbc2", RPreimage: []byte("secret"), State: lnrpc.Invoice_SETTLED},
 	}}}
 	ctx := context.Background()
 
 	open, err := c.LookupInvoice(ctx, []byte("open"))
-	if err != nil || open.Settled || open.Preimage != nil || open.PaymentRequest != "lnbc1" {
+	if err != nil || open.Expired || open.Settled || open.Preimage != nil || open.PaymentRequest != "lnbc1" {
 		t.Fatalf("open = %+v, %v", open, err)
 	}
 	settled, err := c.LookupInvoice(ctx, []byte("settled"))
-	if err != nil || !settled.Settled || string(settled.Preimage) != "secret" {
+	if err != nil || settled.Expired || !settled.Settled || string(settled.Preimage) != "secret" {
 		t.Fatalf("settled = %+v, %v", settled, err)
+	}
+	canceled, err := c.LookupInvoice(ctx, []byte("canceled"))
+	if err != nil || !canceled.Expired || canceled.Settled {
+		t.Fatalf("canceled = %+v, %v", canceled, err)
 	}
 	if _, err := c.LookupInvoice(ctx, []byte("missing")); !errors.Is(err, lightning.ErrInvoiceNotFound) {
 		t.Fatalf("missing: err = %v, want ErrInvoiceNotFound", err)

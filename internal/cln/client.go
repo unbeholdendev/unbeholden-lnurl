@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
 
@@ -159,7 +160,7 @@ func (c *Client) LookupInvoice(ctx context.Context, paymentHash []byte) (lightni
 		return lightning.Invoice{}, lightning.ErrInvoiceNotFound
 	}
 	found := resp.Invoices[0]
-	invoice := lightning.Invoice{PaymentRequest: found.Bolt11, PaymentHash: paymentHash, Settled: found.Status == "paid"}
+	invoice := lightning.Invoice{PaymentRequest: found.Bolt11, PaymentHash: paymentHash, Settled: found.Status == "paid", Expired: found.Status == "expired"}
 	if invoice.Settled {
 		preimage, err := hex.DecodeString(found.PaymentPreimage)
 		if err != nil {
@@ -230,6 +231,10 @@ type invoice struct {
 	Description        string `json:"description"`
 	PayIndex           uint64 `json:"pay_index"`
 	AmountReceivedMsat int64  `json:"amount_received_msat"`
+	PaymentHash        string `json:"payment_hash"`
+	Bolt11             string `json:"bolt11"`
+	PaymentPreimage    string `json:"payment_preimage"`
+	PaidAt             int64  `json:"paid_at"`
 }
 
 // memo returns the memo AddInvoice put in the label, or the description of
@@ -241,6 +246,25 @@ func (inv invoice) memo() string {
 	}
 	_, memo, _ := strings.Cut(rest, " ")
 	return memo
+}
+
+func (inv invoice) settled() (lightning.Settled, error) {
+	hash, err := hex.DecodeString(inv.PaymentHash)
+	if err != nil {
+		return lightning.Settled{}, fmt.Errorf("payment hash: %w", err)
+	}
+	preimage, err := hex.DecodeString(inv.PaymentPreimage)
+	if err != nil {
+		return lightning.Settled{}, fmt.Errorf("payment preimage: %w", err)
+	}
+	return lightning.Settled{
+		AmountMsat:     inv.AmountReceivedMsat,
+		Memo:           inv.memo(),
+		PaymentHash:    hash,
+		PaymentRequest: inv.Bolt11,
+		Preimage:       preimage,
+		SettledAt:      time.Unix(inv.PaidAt, 0),
+	}, nil
 }
 
 // LastPaidIndex returns the highest pay index on the node, or 0 if no
@@ -262,7 +286,7 @@ func (c *Client) LastPaidIndex(ctx context.Context) (uint64, error) {
 // SubscribeInvoices passes invoices paid after the pay index after to
 // onSettled in pay order, until a call fails or onSettled returns an error.
 // resumeFrom is the invoice's pay index.
-func (c *Client) SubscribeInvoices(ctx context.Context, after uint64, onSettled func(amountMsat int64, memo string, resumeFrom uint64) error) error {
+func (c *Client) SubscribeInvoices(ctx context.Context, after uint64, onSettled func(invoice lightning.Settled, resumeFrom uint64) error) error {
 	for {
 		var inv invoice
 		err := c.call(ctx, "waitanyinvoice", map[string]any{"lastpay_index": after, "timeout": waitTimeout}, &inv)
@@ -276,7 +300,11 @@ func (c *Client) SubscribeInvoices(ctx context.Context, after uint64, onSettled 
 		if inv.PayIndex <= after {
 			return fmt.Errorf("waitanyinvoice: pay index %d not after %d", inv.PayIndex, after)
 		}
-		if err := onSettled(inv.AmountReceivedMsat, inv.memo(), inv.PayIndex); err != nil {
+		settled, err := inv.settled()
+		if err != nil {
+			return fmt.Errorf("waitanyinvoice: %w", err)
+		}
+		if err := onSettled(settled, inv.PayIndex); err != nil {
 			return err
 		}
 		after = inv.PayIndex

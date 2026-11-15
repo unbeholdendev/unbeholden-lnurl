@@ -26,6 +26,14 @@ type Config struct {
 	WithdrawSecret string                  `yaml:"withdraw_secret,omitempty"`
 	Withdraw       []WithdrawConfig        `yaml:"withdraw,omitempty"`
 	Addresses      map[string]AddressEntry `yaml:"addresses,omitempty"`
+	Nostr          *NostrConfig            `yaml:"nostr,omitempty"`
+}
+
+// NostrConfig turns on zaps (NIP-57) for every address.
+type NostrConfig struct {
+	PrivateKeyFile string `yaml:"private_key_file"`
+	// PrivateKey is read from PrivateKeyFile.
+	PrivateKey string `yaml:"-"`
 }
 
 // Prefix is an IP address range, written as CIDR or as a single address.
@@ -163,6 +171,13 @@ func Load(path string) (*Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
+	if n := cfg.Nostr; n != nil {
+		key, err := os.ReadFile(n.PrivateKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("read nostr.private_key_file: %w", err)
+		}
+		n.PrivateKey = strings.TrimSpace(string(key))
+	}
 	if n := cfg.Notifications.Ntfy; n != nil && n.TokenFile != "" {
 		token, err := os.ReadFile(n.TokenFile)
 		if err != nil {
@@ -218,8 +233,16 @@ func (c *Config) Validate() error {
 	if c.RateLimit.PerMinute <= 0 || c.RateLimit.Burst <= 0 {
 		return fmt.Errorf("rate_limit.per_minute and rate_limit.burst must be positive")
 	}
-	if (c.Notifies() || len(c.Withdraw) > 0) && c.StateDir == "" {
-		return fmt.Errorf("state_dir is required with notifications or withdraw vouchers")
+	if (c.Notifies() || len(c.Withdraw) > 0 || c.Nostr != nil) && c.StateDir == "" {
+		return fmt.Errorf("state_dir is required with notifications, withdraw vouchers or nostr")
+	}
+	if n := c.Nostr; n != nil {
+		if len(c.Addresses) == 0 {
+			return fmt.Errorf("nostr needs addresses")
+		}
+		if n.PrivateKeyFile == "" {
+			return fmt.Errorf("nostr.private_key_file is required")
+		}
 	}
 	if n := c.Notifications.Ntfy; n != nil {
 		if n.URL == "" || n.Topic == "" {

@@ -1,5 +1,5 @@
 # Each feature runs when its section is present: addresses and withdraw need
-# listen, notifications and withdraw need state_dir.
+# listen; notifications, withdraw and nostr need state_dir.
 listen: "0.0.0.0:8080"
 state_dir: "/app/data"
 
@@ -55,6 +55,11 @@ withdraw:
     description: "Restaurant tip"
     amount: 500000
     count: 20
+
+# Zaps (NIP-57) for every address. The file holds a key of its own, as hex or
+# nsec: openssl rand -hex 32
+# nostr:
+#   private_key_file: "/app/data/nostr.key"
 
 addresses:
   # Addresses are served on whatever domain the request arrives on.

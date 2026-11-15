@@ -4,6 +4,7 @@ package lightning
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
 )
@@ -16,8 +17,19 @@ var ErrPaymentFailed = errors.New("payment failed")
 type Invoice struct {
 	PaymentRequest string
 	PaymentHash    []byte
+	Expired        bool
 	Settled        bool
 	Preimage       []byte // nil until settled
+}
+
+// Settled is an invoice paid on the node.
+type Settled struct {
+	AmountMsat     int64
+	Memo           string
+	PaymentHash    []byte
+	PaymentRequest string
+	Preimage       []byte
+	SettledAt      time.Time
 }
 
 // ErrInvoiceNotFound is returned by a backend's LookupInvoice for an unknown

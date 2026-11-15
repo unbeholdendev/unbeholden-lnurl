@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"unbeholden-lnurl/internal/config"
+	"unbeholden-lnurl/internal/lightning"
 )
 
 // Ntfy sends push notifications via an ntfy server.
@@ -40,10 +41,11 @@ func (n *Ntfy) NotifyInvoiceCreated(amountSats int64, address string, comment st
 }
 
 // NotifyPayment sends a notification for a settled payment.
-func (n *Ntfy) NotifyPayment(amountSats int64, memo string) error {
+func (n *Ntfy) NotifyPayment(invoice lightning.Settled) error {
+	amountSats := invoice.AmountMsat / 1000
 	body := fmt.Sprintf("Received %d sats", amountSats)
-	if memo != "" {
-		body = fmt.Sprintf("Received %d sats: %s", amountSats, memo)
+	if invoice.Memo != "" {
+		body = fmt.Sprintf("Received %d sats: %s", amountSats, invoice.Memo)
 	}
 	return n.send("Payment received", body)
 }

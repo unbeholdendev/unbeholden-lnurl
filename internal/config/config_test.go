@@ -342,3 +342,36 @@ addresses:
 		}
 	}
 }
+
+func TestLoad_Nostr(t *testing.T) {
+	keyPath := filepath.Join(t.TempDir(), "nostr.key")
+	if err := os.WriteFile(keyPath, []byte("nsec1abc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const addresses = `
+listen: "127.0.0.1:8080"
+addresses:
+  "*":
+    min_sendable: 1000
+    max_sendable: 2000
+`
+	nostr := "nostr:\n  private_key_file: \"" + keyPath + "\"\n"
+
+	cfg, err := Load(writeTestConfig(t, lndYAML+addresses+"state_dir: \"/var/lib/x\"\n"+nostr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Nostr.PrivateKey != "nsec1abc" {
+		t.Fatalf("private key = %q", cfg.Nostr.PrivateKey)
+	}
+	for name, yaml := range map[string]string{
+		"no state_dir": lndYAML + addresses + nostr,
+		"no addresses": lndYAML + "state_dir: \"/var/lib/x\"\n" + nostr + "notifications:\n  ntfy:\n    url: \"https://n\"\n    topic: \"t\"\n",
+		"no key file":  lndYAML + addresses + "state_dir: \"/var/lib/x\"\nnostr: {}\n",
+		"missing key":  lndYAML + addresses + "state_dir: \"/var/lib/x\"\nnostr:\n  private_key_file: \"/nonexistent\"\n",
+	} {
+		if _, err := Load(writeTestConfig(t, yaml)); err == nil {
+			t.Errorf("%s: loaded", name)
+		}
+	}
+}

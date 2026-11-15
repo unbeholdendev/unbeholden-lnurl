@@ -24,6 +24,7 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
 - LNURL-pay / Lightning Address support (LUD-06, LUD-16), with comments (LUD-12), a
   message after payment (LUD-09), a long description (LUD-20), an avatar, and payment
   verification (LUD-21)
+- Nostr zaps (NIP-57): zap receipts are published to the payer's relays once paid
 - Notifications for every invoice settled on the node, via ntfy, including ones settled
   while the service was down
 - LNURL-withdraw vouchers (LUD-03) listed in the config
@@ -68,8 +69,17 @@ See [`config.example.yaml`](./config.example.yaml) for all available options.
 Configure one node, under `lnd` or `cln`.
 
 Each feature runs only when its section is present: `addresses` for Lightning Addresses,
-`withdraw` for vouchers, `notifications` for payment notifications. With only
-`notifications`, no HTTP listener is started.
+`withdraw` for vouchers, `notifications` for payment notifications, `nostr` for zaps. With
+only `notifications`, no HTTP listener is started.
+
+### Zaps
+
+`nostr.private_key_file` holds the key zap receipts are signed with, as hex or `nsec`.
+Use a key of its own, not your profile's: it is published as `nostrPubkey`, and the server
+holds it in the clear. Generate one with `openssl rand -hex 32`.
+
+Receipts go to the relays the zap request names, over `wss://` and to public addresses
+only. A relay that refuses one is not retried.
 
 ### Behind a reverse proxy
 
@@ -101,7 +111,7 @@ Give the server a macaroon with only the permissions its enabled features need, 
 | Feature | Permissions |
 | --- | --- |
 | `addresses` | `invoices:read`, `invoices:write` |
-| `notifications` | `invoices:read` |
+| `notifications`, `nostr` | `invoices:read` |
 | `withdraw` | `offchain:write`, `info:read` |
 
 LND's `invoice.macaroon` covers addresses and notifications. Bake others with
@@ -112,7 +122,7 @@ On Core Lightning, give a rune limited to the methods the enabled features call:
 | Feature | Methods |
 | --- | --- |
 | `addresses` | `invoice`, `listinvoices` |
-| `notifications` | `listinvoices`, `waitanyinvoice` |
+| `notifications`, `nostr` | `listinvoices`, `waitanyinvoice` |
 | `withdraw` | `pay`, `listpays`, `getinfo` |
 
 For example, for addresses and notifications:
