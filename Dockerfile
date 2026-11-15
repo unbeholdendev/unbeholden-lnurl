@@ -9,7 +9,8 @@ RUN go mod download
 
 # Build binary
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o unbeholden-lnurl ./cmd/unbeholden-lnurl
+ARG VERSION
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.version=${VERSION}" -o unbeholden-lnurl ./cmd/unbeholden-lnurl
 
 # Runtime stage
 FROM gcr.io/distroless/static:nonroot

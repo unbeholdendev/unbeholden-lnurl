@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	"unbeholden-lnurl/internal/config"
@@ -20,13 +21,18 @@ type Ntfy struct {
 }
 
 // NewNtfy creates an Ntfy notifier.
-func NewNtfy(cfg config.NtfyConfig) *Ntfy {
+func NewNtfy(cfg config.NtfyConfig, proxy ...*url.URL) *Ntfy {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if len(proxy) > 0 && proxy[0] != nil {
+		transport.Proxy = http.ProxyURL(proxy[0])
+	}
 	return &Ntfy{
 		url:   cfg.URL,
 		topic: cfg.Topic,
 		token: cfg.Token,
 		client: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout:   10 * time.Second,
+			Transport: transport,
 		},
 	}
 }

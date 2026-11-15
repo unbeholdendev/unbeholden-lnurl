@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -30,16 +32,45 @@ import (
 
 const shutdownTimeout = lnurl.PayTimeout + 10*time.Second
 
+var version string
+
+func buildVersion() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "dev"
+}
+
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
 	healthcheck := flag.Bool("healthcheck", false, "run health check and exit")
+	showVersion := flag.Bool("version", false, "print version and exit")
+	listVouchers := flag.Bool("list-vouchers", false, "print unclaimed vouchers as JSON and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(buildVersion())
+		return
+	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		slog.Error("load config", "err", err)
 		os.Exit(1)
+	}
+	if *listVouchers {
+		handler, err := lnurl.NewWithdrawHandler(cfg.ExpandVouchers(), cfg.WithdrawK1Key(), nil, nil, nil, filepath.Join(cfg.StateDir, "state.json"))
+		if err == nil {
+			err = json.NewEncoder(os.Stdout).Encode(handler.UnclaimedVouchers())
+		}
+		if err != nil {
+			slog.Error("list vouchers", "err", err)
+			os.Exit(1)
+		}
+		return
 	}
 	if *healthcheck {
 		if err := checkHealth(cfg.Listen); err != nil {
@@ -109,7 +140,7 @@ func run(ctx context.Context, cfg *config.Config) error {
 	// Kept apart from ntfy: a nil *Ntfy in an interface is not a nil Notifier.
 	var notify lnurl.Notifier
 	if n := cfg.Notifications.Ntfy; n != nil {
-		ntfy = notifier.NewNtfy(*n)
+		ntfy = notifier.NewNtfy(*n, cfg.ProxyURL)
 		notify = ntfy
 	}
 
@@ -119,7 +150,7 @@ func run(ctx context.Context, cfg *config.Config) error {
 		if err != nil {
 			return fmt.Errorf("nostr.private_key_file: %w", err)
 		}
-		zapper = zap.New(key, nostr.NewPublisher(), filepath.Join(cfg.StateDir, "zaps"))
+		zapper = zap.New(key, nostr.NewPublisher(cfg.ProxyURL), filepath.Join(cfg.StateDir, "zaps"))
 		slog.Info("zaps enabled", "nostr_pubkey", zapper.PubKey())
 	}
 
@@ -197,9 +228,6 @@ func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.
 		}
 		unclaimed := withdrawHandler.UnclaimedVouchers()
 		slog.Info("withdraw vouchers", "unclaimed", len(unclaimed))
-		for _, v := range unclaimed {
-			slog.Info("unclaimed voucher", "id", v.ID, "sats", v.Amount/1000, "url", v.URL, "lnurl", v.LNURL)
-		}
 	}
 	var addressHandler *lnurl.AddressHandler
 	if len(cfg.Addresses) > 0 {

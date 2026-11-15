@@ -339,3 +339,20 @@ func TestWithdraw_WithoutNotifier(t *testing.T) {
 	}
 	wantStatus(t, claim(t, h), "OK", "")
 }
+
+func TestOnionWithdrawURLs(t *testing.T) {
+	voucher := testVoucher
+	voucher.Domain = "TEST.onion:80"
+	h, err := NewWithdrawHandler([]config.Voucher{voucher}, nil, nil, nil, nil, filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unclaimed := h.UnclaimedVouchers()
+	if len(unclaimed) != 1 || unclaimed[0].URL != "http://TEST.onion:80/lnurl/withdraw/"+voucher.Token {
+		t.Fatalf("vouchers = %v", unclaimed)
+	}
+	resp := call(t, context.Background(), h.HandleFirst, "http://TEST.onion:80/lnurl/withdraw/"+voucher.Token, voucher.Token)
+	if resp["callback"] != "http://TEST.onion:80/lnurl/withdraw/"+voucher.Token+"/claim" {
+		t.Fatalf("callback = %v", resp["callback"])
+	}
+}

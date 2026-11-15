@@ -1,13 +1,16 @@
 package config
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"strings"
 	"unicode/utf8"
@@ -16,17 +19,21 @@ import (
 )
 
 type Config struct {
-	Listen         string                  `yaml:"listen,omitempty"`
-	TrustedProxies []Prefix                `yaml:"trusted_proxies,omitempty"`
-	RateLimit      RateLimit               `yaml:"rate_limit,omitempty"`
-	LND            *LNDConfig              `yaml:"lnd,omitempty"`
-	CLN            *CLNConfig              `yaml:"cln,omitempty"`
-	StateDir       string                  `yaml:"state_dir,omitempty"`
-	Notifications  NotificationsConfig     `yaml:"notifications,omitempty"`
-	WithdrawSecret string                  `yaml:"withdraw_secret,omitempty"`
-	Withdraw       []WithdrawConfig        `yaml:"withdraw,omitempty"`
-	Addresses      map[string]AddressEntry `yaml:"addresses,omitempty"`
-	Nostr          *NostrConfig            `yaml:"nostr,omitempty"`
+	VerifyKeyFile      string                  `yaml:"verify_key_file,omitempty"`
+	OutboundProxy      string                  `yaml:"outbound_proxy,omitempty"`
+	ProxyURL           *url.URL                `yaml:"-"`
+	Listen             string                  `yaml:"listen,omitempty"`
+	TrustedProxies     []Prefix                `yaml:"trusted_proxies,omitempty"`
+	RateLimit          RateLimit               `yaml:"rate_limit,omitempty"`
+	LND                *LNDConfig              `yaml:"lnd,omitempty"`
+	CLN                *CLNConfig              `yaml:"cln,omitempty"`
+	StateDir           string                  `yaml:"state_dir,omitempty"`
+	Notifications      NotificationsConfig     `yaml:"notifications,omitempty"`
+	WithdrawSecretFile string                  `yaml:"withdraw_secret_file,omitempty"`
+	WithdrawSecret     string                  `yaml:"withdraw_secret,omitempty"`
+	Withdraw           []WithdrawConfig        `yaml:"withdraw,omitempty"`
+	Addresses          map[string]AddressEntry `yaml:"addresses,omitempty"`
+	Nostr              *NostrConfig            `yaml:"nostr,omitempty"`
 }
 
 // NostrConfig turns on zaps (NIP-57) for every address.
@@ -140,19 +147,23 @@ func (c *Config) WithdrawK1Key() []byte {
 	return mac.Sum(nil)
 }
 
-// VerifyKey returns the key for signing LUD-21 verify URLs. It is derived
-// from the node's macaroon or rune, so it needs no secret of its own;
-// replacing that credential breaks verify URLs already issued.
+// VerifyKey returns the key for signing LUD-21 verify URLs. Without a
+// verify_key_file, it uses the node credential for backwards compatibility.
 func (c *Config) VerifyKey() ([]byte, error) {
-	var path string
-	if c.LND != nil {
-		path = c.LND.Macaroon
-	} else {
-		path = c.CLN.RuneFile
+	path := c.VerifyKeyFile
+	if path == "" {
+		if c.LND != nil {
+			path = c.LND.Macaroon
+		} else {
+			path = c.CLN.RuneFile
+		}
 	}
 	credential, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read node credential: %w", err)
+		return nil, fmt.Errorf("read verify key source: %w", err)
+	}
+	if len(credential) == 0 {
+		return nil, fmt.Errorf("verify key source is empty")
 	}
 	mac := hmac.New(sha256.New, []byte("unbeholden-lnurl verify"))
 	mac.Write(credential)
@@ -165,11 +176,26 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 	cfg := Config{RateLimit: DefaultRateLimit}
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, fmt.Errorf("parse config: expected one YAML document")
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
+	}
+	if cfg.WithdrawSecretFile != "" {
+		secret, err := os.ReadFile(cfg.WithdrawSecretFile)
+		if err != nil {
+			return nil, fmt.Errorf("read withdraw_secret_file: %w", err)
+		}
+		cfg.WithdrawSecret = strings.TrimSpace(string(secret))
+		if len(cfg.Withdraw) > 0 && len(cfg.WithdrawSecret) < minWithdrawSecretLen {
+			return nil, fmt.Errorf("withdraw_secret_file must contain at least %d characters", minWithdrawSecretLen)
+		}
 	}
 	if n := cfg.Nostr; n != nil {
 		key, err := os.ReadFile(n.PrivateKeyFile)
@@ -215,6 +241,13 @@ func (a *AddressEntry) loadImage() error {
 }
 
 func (c *Config) Validate() error {
+	if c.OutboundProxy != "" {
+		proxy, err := url.Parse(c.OutboundProxy)
+		if err != nil || proxy.Scheme != "socks5" || proxy.Hostname() == "" || proxy.Port() == "" || proxy.Path != "" || proxy.RawQuery != "" || proxy.Fragment != "" {
+			return fmt.Errorf("outbound_proxy must be a socks5://host:port URL")
+		}
+		c.ProxyURL = proxy
+	}
 	if (c.LND == nil) == (c.CLN == nil) {
 		return fmt.Errorf("configure one node: lnd or cln")
 	}
@@ -252,7 +285,10 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("notifications.ntfy: set token or token_file, not both")
 		}
 	}
-	if len(c.Withdraw) > 0 && len(c.WithdrawSecret) < minWithdrawSecretLen {
+	if c.WithdrawSecret != "" && c.WithdrawSecretFile != "" {
+		return fmt.Errorf("set withdraw_secret or withdraw_secret_file, not both")
+	}
+	if len(c.Withdraw) > 0 && c.WithdrawSecretFile == "" && len(c.WithdrawSecret) < minWithdrawSecretLen {
 		return fmt.Errorf("withdraw_secret must be at least %d characters when withdraw vouchers are configured", minWithdrawSecretLen)
 	}
 	for i, w := range c.Withdraw {

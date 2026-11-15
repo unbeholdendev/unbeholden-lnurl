@@ -111,7 +111,7 @@ func (h *WithdrawHandler) HandleFirst(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, withdrawRequest{
 		Tag:                "withdrawRequest",
-		Callback:           fmt.Sprintf("https://%s/lnurl/withdraw/%s/claim", r.Host, token),
+		Callback:           fmt.Sprintf("%s/lnurl/withdraw/%s/claim", hostURL(r.Host), token),
 		K1:                 hex.EncodeToString(h.signK1(voucher.ID, uint64(time.Now().Add(k1TTL).Unix()))),
 		DefaultDescription: voucher.Description,
 		MinWithdrawable:    voucher.Amount,
@@ -269,7 +269,7 @@ func (h *WithdrawHandler) UnclaimedVouchers() []VoucherStatus {
 	var result []VoucherStatus
 	for _, v := range h.vouchers {
 		if _, claimed := h.claimed[v.ID]; !claimed {
-			url := fmt.Sprintf("https://%s/lnurl/withdraw/%s", v.Domain, v.Token)
+			url := fmt.Sprintf("%s/lnurl/withdraw/%s", hostURL(v.Domain), v.Token)
 			lnurl, _ := LNURLEncode(url)
 			result = append(result, VoucherStatus{
 				ID:     v.ID,

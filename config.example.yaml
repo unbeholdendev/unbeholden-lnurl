@@ -3,6 +3,9 @@
 listen: "0.0.0.0:8080"
 state_dir: "/app/data"
 
+# SOCKS5 proxy for ntfy and relay publishing. Does not affect the node connection.
+# outbound_proxy: "socks5://127.0.0.1:9050"
+
 # Reverse proxies in front of this service, as IP addresses or CIDR ranges.
 # X-Forwarded-For and X-Forwarded-Host are honoured only on requests from them.
 trusted_proxies:
@@ -13,6 +16,10 @@ trusted_proxies:
 rate_limit:
   per_minute: 60
   burst: 30
+
+# Stable key source for LUD-21 verify URLs, independent of node credentials.
+# For a new deployment: openssl rand -out verify.key 32
+# verify_key_file: "/run/secrets/verify-key"
 
 # One node: lnd or cln.
 lnd:
@@ -35,9 +42,10 @@ notifications:
     # Or token_file: a file holding the token.
     token: ""
 
-# Required with withdraw vouchers. Generate with: openssl rand -hex 32
-# Changing it changes every voucher URL.
-withdraw_secret: ""
+# Required with withdraw vouchers. Generate the file with: openssl rand -hex 32
+# Changing the secret changes every voucher URL.
+# Use withdraw_secret for an inline value, or withdraw_secret_file, not both.
+withdraw_secret_file: "/run/secrets/withdraw"
 
 withdraw:
   - id: "tip-001"

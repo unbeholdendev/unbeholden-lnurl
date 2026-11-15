@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	socksproxy "golang.org/x/net/proxy"
 )
 
 const publishTimeout = 10 * time.Second
@@ -24,13 +25,29 @@ type Publisher struct {
 }
 
 // NewPublisher returns a Publisher that connects only to public addresses,
-// since relays are named by whoever sends a zap request.
-func NewPublisher() *Publisher {
+// since relays are named by whoever sends a zap request. With a proxy,
+// address filtering and name resolution are left to the proxy.
+func NewPublisher(proxy ...*url.URL) *Publisher {
 	netDialer := &net.Dialer{Timeout: publishTimeout, Control: publicOnly}
-	return &Publisher{dialer: &websocket.Dialer{
+	dialer := &websocket.Dialer{
 		NetDialContext:   netDialer.DialContext,
 		HandshakeTimeout: publishTimeout,
-	}}
+	}
+	if len(proxy) > 0 && proxy[0] != nil {
+		netDialer.Control = nil
+		dialer.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			d, err := socksproxy.FromURL(proxy[0], netDialer)
+			if err != nil {
+				return nil, err
+			}
+			contextual, ok := d.(socksproxy.ContextDialer)
+			if !ok {
+				return nil, errors.New("proxy does not support context-aware dialing")
+			}
+			return contextual.DialContext(ctx, network, address)
+		}
+	}
+	return &Publisher{dialer: dialer}
 }
 
 var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")

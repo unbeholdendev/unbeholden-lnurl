@@ -40,8 +40,8 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
   - an LND node reachable over gRPC, plus its TLS certificate and a macaroon
   - a Core Lightning node with CLNRest enabled (`clnrest-port`), plus a rune and the
     node's `ca.pem`
-- A domain with HTTPS terminated in front of the server (Caddy, nginx, or similar).
-  The `.well-known` endpoint must be served over TLS for wallets to accept it.
+- A domain with a reverse proxy in front of the server (Caddy, nginx, or similar).
+  Onion domains use HTTP; other domains need TLS.
 - Go 1.25+ if building from source
 
 ## Quick start
@@ -72,6 +72,27 @@ Each feature runs only when its section is present: `addresses` for Lightning Ad
 `withdraw` for vouchers, `notifications` for payment notifications, `nostr` for zaps. With
 only `notifications`, no HTTP listener is started.
 
+### Payment verification
+
+Set `verify_key_file` to keep LUD-21 verify URLs valid when the node's macaroon or rune
+changes. For a new deployment, create a private file with `openssl rand -out verify.key 32`.
+Keep it across restarts. To preserve existing verify URLs, copy the current macaroon or
+rune file byte for byte before changing the node credential, then use that copy.
+
+Without `verify_key_file`, the server still derives the key from the node credential.
+Replacing that credential invalidates previously issued verify URLs.
+
+### Withdraw vouchers
+
+Keep the withdraw secret outside the config with `withdraw_secret_file`. The file holds
+at least 32 characters; generate it with `openssl rand -hex 32`. Use either
+`withdraw_secret` or `withdraw_secret_file`, not both. Moving the same secret to a file
+preserves voucher URLs. Voucher definitions may stay in a world-readable config.
+
+Startup logs show only the unclaimed voucher count. To print their URLs and LNURLs as
+JSON, run `unbeholden-lnurl -config config.yaml -list-vouchers`. It reads the claim state
+and exits without connecting to the node. Treat its output as bearer secrets.
+
 ### Zaps
 
 `nostr.private_key_file` holds the key zap receipts are signed with, as hex or `nsec`.
@@ -80,6 +101,11 @@ holds it in the clear. Generate one with `openssl rand -hex 32`.
 
 Receipts go to the relays the zap request names, over `wss://` and to public addresses
 only. A relay that refuses one is not retried.
+
+Set `outbound_proxy: "socks5://127.0.0.1:9050"` to send ntfy requests and relay
+publishing through a SOCKS5 proxy. The node connection is unchanged. The proxy resolves
+relay names and must enforce any address restrictions; the server's public-address
+check applies only to direct relay connections.
 
 ### Behind a reverse proxy
 

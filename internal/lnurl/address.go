@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 
 	"unbeholden-lnurl/internal/config"
@@ -103,7 +105,7 @@ func (h *AddressHandler) HandleWellKnown(w http.ResponseWriter, r *http.Request)
 
 	resp := payRequest{
 		Tag:            "payRequest",
-		Callback:       fmt.Sprintf("https://%s/.well-known/lnurlp/%s/invoice", r.Host, username),
+		Callback:       fmt.Sprintf("%s/.well-known/lnurlp/%s/invoice", hostURL(r.Host), username),
 		Metadata:       addressMetadata(addr, username, r.Host),
 		MinSendable:    addr.MinSendable,
 		MaxSendable:    addr.MaxSendable,
@@ -185,7 +187,7 @@ func (h *AddressHandler) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 	resp := invoiceResponse{
 		PR:     invoice.PaymentRequest,
 		Routes: []struct{}{},
-		Verify: fmt.Sprintf("https://%s/.well-known/lnurlp/%s/verify/%x", r.Host, username, h.verifyToken(username, invoice.PaymentHash)),
+		Verify: fmt.Sprintf("%s/.well-known/lnurlp/%s/verify/%x", hostURL(r.Host), username, h.verifyToken(username, invoice.PaymentHash)),
 	}
 	if addr.SuccessMessage != "" {
 		resp.SuccessAction = &successAction{Tag: "message", Message: addr.SuccessMessage}
@@ -257,4 +259,12 @@ func addressMetadata(addr config.AddressEntry, username, host string) string {
 	}
 	data, _ := json.Marshal(entries)
 	return string(data)
+}
+
+func hostURL(host string) string {
+	u := url.URL{Scheme: "https", Host: host}
+	if strings.HasSuffix(strings.ToLower(strings.TrimSuffix(u.Hostname(), ".")), ".onion") {
+		u.Scheme = "http"
+	}
+	return u.String()
 }

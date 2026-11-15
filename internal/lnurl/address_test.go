@@ -340,3 +340,28 @@ func TestZaps(t *testing.T) {
 		t.Fatalf("description without zaps = %q, want the metadata", node.description)
 	}
 }
+
+func TestOnionCallbacks(t *testing.T) {
+	h := NewAddressHandler(map[string]config.AddressEntry{"*": {MinSendable: 1000, MaxSendable: 2000}}, &fakeNode{}, nil, testVerifyKey, nil)
+	for _, endpoint := range []string{"", "/invoice?amount=1500"} {
+		req := httptest.NewRequest("GET", "http://test.onion:80/.well-known/lnurlp/bob"+endpoint, nil)
+		req.SetPathValue("username", "bob")
+		rec := httptest.NewRecorder()
+		if endpoint == "" {
+			h.HandleWellKnown(rec, req)
+		} else {
+			h.HandleInvoice(rec, req)
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		field := "callback"
+		if endpoint != "" {
+			field = "verify"
+		}
+		if got, _ := resp[field].(string); !strings.HasPrefix(got, "http://test.onion:80/") {
+			t.Fatalf("%s = %v", field, resp[field])
+		}
+	}
+}

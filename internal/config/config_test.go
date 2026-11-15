@@ -375,3 +375,84 @@ addresses:
 		}
 	}
 }
+func TestLoadOutboundProxy(t *testing.T) {
+	base := lndYAML + "state_dir: /tmp/state\nnotifications:\n  ntfy:\n    url: https://ntfy.example\n    topic: t\n"
+	for _, proxy := range []string{"socks5://127.0.0.1:9050", "https://proxy:9050", "socks5://", "socks5://proxy", "socks5://proxy:9050/path"} {
+		cfg, err := Load(writeTestConfig(t, base+"outbound_proxy: "+proxy+"\n"))
+		if proxy != "socks5://127.0.0.1:9050" {
+			if err == nil {
+				t.Fatalf("accepted %q", proxy)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ProxyURL == nil || cfg.ProxyURL.String() != proxy {
+			t.Fatalf("proxy = %v", cfg.ProxyURL)
+		}
+	}
+}
+
+func TestLoadRejectsUnknownKeys(t *testing.T) {
+	for _, extra := range []string{"trusted_proxys: []", "notifications:\n  ntfy:\n    url: https://ntfy.example\n    topic: t\n    tokne: bad"} {
+		_, err := Load(writeTestConfig(t, lndYAML+"state_dir: /tmp/state\nlisten: :8080\naddresses:\n  '*':\n    min_sendable: 1000\n    max_sendable: 2000\n"+extra))
+		if err == nil {
+			t.Fatalf("accepted unknown key in %q", extra)
+		}
+	}
+}
+
+func TestLoadWithdrawSecretFile(t *testing.T) {
+	secret := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(secret, []byte(strings.Repeat("x", 32)+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	base := lndYAML + "listen: :8080\nstate_dir: /tmp/state\nwithdraw:\n  - id: tip\n    domain: example.com\n    amount: 1000\n"
+	for _, value := range []string{strings.Repeat("x", 32) + "\n", "short\n"} {
+		os.WriteFile(secret, []byte(value), 0600)
+		cfg, err := Load(writeTestConfig(t, base+"withdraw_secret_file: "+secret+"\n"))
+		if len(strings.TrimSpace(value)) < 32 {
+			if err == nil {
+				t.Fatal("accepted short file secret")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.WithdrawSecret != strings.TrimSpace(value) {
+			t.Fatal("secret was not trimmed")
+		}
+	}
+	if _, err := Load(writeTestConfig(t, base+"withdraw_secret_file: "+secret+"\nwithdraw_secret: "+strings.Repeat("x", 32))); err == nil {
+		t.Fatal("accepted both secret sources")
+	}
+}
+
+func TestVerifyKeySurvivesCredentialRotation(t *testing.T) {
+	dir := t.TempDir()
+	credential := filepath.Join(dir, "macaroon")
+	keyFile := filepath.Join(dir, "verify-key")
+	original := []byte("old node credential")
+	os.WriteFile(credential, original, 0600)
+	legacy := &Config{LND: &LNDConfig{Macaroon: credential}}
+	before, err := legacy.VerifyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(keyFile, original, 0600)
+	cfg, err := Load(writeTestConfig(t, lndYAML+"listen: :8080\nverify_key_file: "+keyFile+"\naddresses:\n  '*':\n    min_sendable: 1000\n    max_sendable: 2000\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.LND.Macaroon = credential
+	os.WriteFile(credential, []byte("new node credential"), 0600)
+	after, err := cfg.VerifyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(before, after) {
+		t.Fatal("credential rotation changed verify key")
+	}
+}

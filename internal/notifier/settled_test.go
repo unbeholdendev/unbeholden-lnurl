@@ -2,12 +2,17 @@ package notifier
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"unbeholden-lnurl/internal/config"
 	"unbeholden-lnurl/internal/lightning"
@@ -122,5 +127,70 @@ func TestInitSettled_RecordsBaselineBeforeNewPayments(t *testing.T) {
 	watchOnce(context.Background(), f, path, func(lightning.Settled) error { delivered++; return nil })
 	if delivered != 1 {
 		t.Fatalf("delivered %d payments, want 1", delivered)
+	}
+}
+
+func TestNtfyUsesSOCKSProxy(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	target := make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		greeting := make([]byte, 3)
+		if _, err := io.ReadFull(conn, greeting); err != nil {
+			return
+		}
+		conn.Write([]byte{5, 0})
+		head := make([]byte, 5)
+		if _, err := io.ReadFull(conn, head); err != nil || head[3] != 3 {
+			return
+		}
+		name := make([]byte, int(head[4])+2)
+		if _, err := io.ReadFull(conn, name); err != nil {
+			return
+		}
+		target <- string(name[:len(name)-2])
+	}()
+	proxy, _ := url.Parse("socks5://" + ln.Addr().String())
+	n := NewNtfy(config.NtfyConfig{URL: "http://ntfy.invalid", Topic: "t"}, proxy)
+	n.NotifyPayment(lightning.Settled{AmountMsat: 1000})
+	select {
+	case got := <-target:
+		if got != "ntfy.invalid" {
+			t.Fatalf("proxy target = %q", got)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("ntfy did not use SOCKS proxy")
+	}
+}
+
+func TestSettledSharedPositionRetriesFirstDelivery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settle_index")
+	invoices := &fakeInvoices{settled: []uint64{1, 2, 3}}
+	var receipts []int64
+	onSettled := func(invoice lightning.Settled) error {
+		receipts = append(receipts, invoice.AmountMsat)
+		return fmt.Errorf("ntfy unavailable")
+	}
+	for range 2 {
+		watchOnce(context.Background(), invoices, path, onSettled)
+	}
+	if !slices.Equal(receipts, []int64{1000, 1000}) {
+		t.Fatalf("shared position delivered %v", receipts)
+	}
+	index, err := loadIndex(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index != 0 {
+		t.Fatalf("position = %d, want 0 after failed delivery", index)
 	}
 }
