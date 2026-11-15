@@ -170,6 +170,9 @@ go run ./cmd/unbeholden-lnurl
 go test ./...
 ```
 
+The [regtest integration suite](integration/README.md) starts disposable LND and Core
+Lightning nodes to test payments, configuration and restart recovery.
+
 Layout follows the standard Go convention: entrypoint in `cmd/unbeholden-lnurl`, everything
 else under `internal/`.
 
