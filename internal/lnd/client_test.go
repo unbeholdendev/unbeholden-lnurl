@@ -7,11 +7,11 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/lightningnetwork/lnd/lnrpc"
-	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"unbeholden-lnurl/internal/lnd/lnrpc"
+	"unbeholden-lnurl/internal/lnd/routerrpc"
 
 	"unbeholden-lnurl/internal/lightning"
 )

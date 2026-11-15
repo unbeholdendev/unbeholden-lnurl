@@ -42,7 +42,7 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
     node's `ca.pem`
 - A domain with a reverse proxy in front of the server (Caddy, nginx, or similar).
   Onion domains use HTTP; other domains need TLS.
-- Go 1.25+ if building from source
+- Go 1.26+ if building from source
 
 ## Quick start
 

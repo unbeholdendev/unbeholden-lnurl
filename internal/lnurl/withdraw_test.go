@@ -21,10 +21,9 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
+	"github.com/btcsuite/btcd/btcutil/bech32"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/lightningnetwork/lnd/zpay32"
 )
 
 type fakeNode struct {
@@ -111,7 +110,7 @@ func newWithdraw(t *testing.T, node *fakeNode, statePath string) *WithdrawHandle
 	return h
 }
 
-func invoice(t *testing.T, net *chaincfg.Params, amountMsat int64) string {
+func invoice(t *testing.T, net *chaincfg.Params, amountMsat int64, extraFields ...[]byte) string {
 	t.Helper()
 	key, err := btcec.NewPrivateKey()
 	if err != nil {
@@ -119,13 +118,33 @@ func invoice(t *testing.T, net *chaincfg.Params, amountMsat int64) string {
 	}
 	var hash [32]byte
 	rand.Read(hash[:])
-	inv, err := zpay32.NewInvoice(net, hash, time.Now(), zpay32.Amount(lnwire.MilliSatoshi(amountMsat)), zpay32.Description("tip"))
-	if err != nil {
-		t.Fatal(err)
+	hrp := fmt.Sprintf("ln%s%dp", net.Bech32HRPSegwit, amountMsat*10)
+	if net.Name == "signet" {
+		hrp = fmt.Sprintf("lntbs%dp", amountMsat*10)
 	}
-	pr, err := inv.Encode(zpay32.MessageSigner{SignCompact: func(msg []byte) ([]byte, error) {
-		return ecdsa.SignCompact(key, chainhash.HashB(msg), true), nil
-	}})
+	if net.Name == "regtest" {
+		hrp = fmt.Sprintf("lnbcrt%dp", amountMsat*10)
+	}
+	data := make([]byte, 7)
+	now := uint64(time.Now().Unix())
+	for i := 6; i >= 0; i-- {
+		data[i] = byte(now & 31)
+		now >>= 5
+	}
+	hashWords, _ := bech32.ConvertBits(hash[:], 8, 5, true)
+	data = append(data, 1, 1, 20)
+	data = append(data, hashWords...)
+	desc, _ := bech32.ConvertBits([]byte("tip"), 8, 5, true)
+	data = append(data, 13, 0, byte(len(desc)))
+	data = append(data, desc...)
+	for _, fields := range extraFields {
+		data = append(data, fields...)
+	}
+	payload, _ := bech32.ConvertBits(data, 5, 8, true)
+	signature := ecdsa.SignCompact(key, chainhash.HashB(append([]byte(hrp), payload...)), true)
+	signature = append(signature[1:], signature[0]-31)
+	words, _ := bech32.ConvertBits(signature, 8, 5, true)
+	pr, err := bech32.Encode(hrp, append(data, words...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,6 +357,48 @@ func TestWithdraw_WithoutNotifier(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantStatus(t, claim(t, h), "OK", "")
+}
+
+func TestValidateBolt11(t *testing.T) {
+	for _, network := range []*chaincfg.Params{&chaincfg.MainNetParams, &chaincfg.TestNet3Params, &chaincfg.SigNetParams, &chaincfg.RegressionNetParams} {
+		t.Run(network.Name, func(t *testing.T) {
+			request := invoice(t, network, 12345)
+			if err := validateBolt11(request, 12345, network); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateBolt11(request, 12346, network); err == nil {
+				t.Fatal("accepted wrong amount")
+			}
+		})
+	}
+	const expired = "lnbc1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq8rkx3yf5tcsyz3d73gafnh3cax9rn449d9p5uxz9ezhhypd0elx87sjle52x86fux2ypatgddc6k63n7erqz25le42c4u4ecky03ylcqca784w"
+	if err := validateBolt11(expired, 1, &chaincfg.MainNetParams); err == nil || err.Error() != "invoice has expired" {
+		t.Fatalf("expired invoice: %v", err)
+	}
+}
+
+func TestWithdraw_MalformedRoutingDoesNotClaim(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field []byte
+	}{
+		{"route hint", append([]byte{3, 0, 8}, make([]byte, 8)...)},
+		{"fallback", []byte{9, 0, 0}},
+		{"blinded path", []byte{20, 0, 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &fakeNode{}
+			path := filepath.Join(t.TempDir(), "state.json")
+			h := newWithdraw(t, node, path)
+			k1 := first(t, h)["k1"].(string)
+			pr := invoice(t, &chaincfg.MainNetParams, testVoucher.Amount, tc.field)
+			wantStatus(t, claimWith(t, context.Background(), h, k1, pr), "ERROR", "")
+			if node.payments != 0 || len(h.UnclaimedVouchers()) != 1 || claimedOnDisk(t, path) {
+				t.Fatal("malformed invoice reached payer or claimed voucher")
+			}
+			wantStatus(t, claim(t, h), "OK", "")
+		})
+	}
 }
 
 func TestOnionWithdrawURLs(t *testing.T) {

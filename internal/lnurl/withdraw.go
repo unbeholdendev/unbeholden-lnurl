@@ -16,11 +16,11 @@ import (
 	"time"
 
 	"unbeholden-lnurl/internal/atomicfile"
+	"unbeholden-lnurl/internal/bolt11"
 	"unbeholden-lnurl/internal/config"
 	"unbeholden-lnurl/internal/lightning"
 
 	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/lightningnetwork/lnd/zpay32"
 )
 
 const k1TTL = 5 * time.Minute
@@ -220,15 +220,15 @@ func (h *WithdrawHandler) verifyK1(voucherID, k1 string) error {
 // validateBolt11 checks that payReq is an unexpired invoice for network whose
 // amount, if set, is expectedAmountMsat.
 func validateBolt11(payReq string, expectedAmountMsat int64, network *chaincfg.Params) error {
-	invoice, err := zpay32.Decode(payReq, network)
+	invoice, err := bolt11.Decode(payReq, network)
 	if err != nil {
 		return fmt.Errorf("invalid invoice: %w", err)
 	}
-	if time.Since(invoice.Timestamp) > invoice.Expiry() {
+	if time.Since(invoice.Timestamp) > invoice.Expiry {
 		return fmt.Errorf("invoice has expired")
 	}
-	if invoice.MilliSat != nil {
-		if amount := int64(*invoice.MilliSat); amount != expectedAmountMsat {
+	if invoice.AmountMsat != nil {
+		if amount := int64(*invoice.AmountMsat); amount != expectedAmountMsat {
 			return fmt.Errorf("invoice amount %d msat does not match voucher amount %d msat", amount, expectedAmountMsat)
 		}
 	}

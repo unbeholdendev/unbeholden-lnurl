@@ -24,8 +24,8 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/lightningnetwork/lnd/zpay32"
 
+	invoicecodec "unbeholden-lnurl/internal/bolt11"
 	"unbeholden-lnurl/internal/config"
 	"unbeholden-lnurl/internal/nostr"
 )
@@ -291,12 +291,12 @@ func testAddress(t *testing.T, n *network, binary, node string) {
 
 func checkInvoice(t *testing.T, bolt11, description string) {
 	t.Helper()
-	inv, err := zpay32.Decode(bolt11, &chaincfg.RegressionNetParams)
+	inv, err := invoicecodec.Decode(bolt11, &chaincfg.RegressionNetParams)
 	if err != nil {
 		t.Fatal(err)
 	}
 	hash := sha256.Sum256([]byte(description))
-	if inv.MilliSat == nil || int64(*inv.MilliSat) != 100000 || inv.DescriptionHash == nil || *inv.DescriptionHash != hash {
+	if inv.AmountMsat == nil || int64(*inv.AmountMsat) != 100000 || inv.DescriptionHash == nil || *inv.DescriptionHash != hash {
 		t.Fatalf("invoice does not commit to amount and description: %s", bolt11)
 	}
 }
