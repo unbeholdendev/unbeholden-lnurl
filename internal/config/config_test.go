@@ -310,3 +310,35 @@ func TestVerifyKey_FromNodeCredential(t *testing.T) {
 		t.Fatal("keys from different credentials match")
 	}
 }
+
+func TestLoad_RateLimit(t *testing.T) {
+	load := func(extra string) (*Config, error) {
+		return Load(writeTestConfig(t, lndYAML+`
+listen: "127.0.0.1:8080"
+addresses:
+  "*":
+    min_sendable: 1000
+    max_sendable: 2000
+`+extra))
+	}
+
+	cfg, err := load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RateLimit != DefaultRateLimit {
+		t.Fatalf("default = %+v, want %+v", cfg.RateLimit, DefaultRateLimit)
+	}
+	cfg, err = load("rate_limit:\n  per_minute: 600\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (RateLimit{PerMinute: 600, Burst: DefaultRateLimit.Burst}); cfg.RateLimit != want {
+		t.Fatalf("per_minute only = %+v, want %+v", cfg.RateLimit, want)
+	}
+	for _, bad := range []string{"per_minute: 0", "burst: -1"} {
+		if _, err := load("rate_limit:\n  " + bad + "\n"); err == nil {
+			t.Errorf("%s: loaded", bad)
+		}
+	}
+}

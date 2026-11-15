@@ -18,6 +18,7 @@ import (
 type Config struct {
 	Listen         string                  `yaml:"listen,omitempty"`
 	TrustedProxies []Prefix                `yaml:"trusted_proxies,omitempty"`
+	RateLimit      RateLimit               `yaml:"rate_limit,omitempty"`
 	LND            *LNDConfig              `yaml:"lnd,omitempty"`
 	CLN            *CLNConfig              `yaml:"cln,omitempty"`
 	StateDir       string                  `yaml:"state_dir,omitempty"`
@@ -44,6 +45,16 @@ func (p *Prefix) UnmarshalText(text []byte) error {
 	p.Prefix = prefix.Masked()
 	return nil
 }
+
+// RateLimit bounds requests per client address: Burst at once, then
+// PerMinute a minute.
+type RateLimit struct {
+	PerMinute int `yaml:"per_minute"`
+	Burst     int `yaml:"burst"`
+}
+
+// DefaultRateLimit lets a client poll once a second.
+var DefaultRateLimit = RateLimit{PerMinute: 60, Burst: 30}
 
 type LNDConfig struct {
 	Host     string `yaml:"host"`
@@ -145,7 +156,7 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	var cfg Config
+	cfg := Config{RateLimit: DefaultRateLimit}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
@@ -203,6 +214,9 @@ func (c *Config) Validate() error {
 	}
 	if c.ServesHTTP() && c.Listen == "" {
 		return fmt.Errorf("listen is required with addresses or withdraw vouchers")
+	}
+	if c.RateLimit.PerMinute <= 0 || c.RateLimit.Burst <= 0 {
+		return fmt.Errorf("rate_limit.per_minute and rate_limit.burst must be positive")
 	}
 	if (c.Notifies() || len(c.Withdraw) > 0) && c.StateDir == "" {
 		return fmt.Errorf("state_dir is required with notifications or withdraw vouchers")

@@ -16,7 +16,7 @@ const withdrawPath = "/lnurl/withdraw/"
 
 // New returns an HTTP server for the given handlers, either of which may be
 // nil. It honours forwarding headers only on requests from trustedProxies.
-func New(trustedProxies []config.Prefix, withdraw *lnurl.WithdrawHandler, address *lnurl.AddressHandler) *http.Server {
+func New(trustedProxies []config.Prefix, rateLimit config.RateLimit, withdraw *lnurl.WithdrawHandler, address *lnurl.AddressHandler) *http.Server {
 	mux := http.NewServeMux()
 	if withdraw != nil {
 		mux.HandleFunc("GET "+withdrawPath+"{token}", withdraw.HandleFirst)
@@ -33,7 +33,7 @@ func New(trustedProxies []config.Prefix, withdraw *lnurl.WithdrawHandler, addres
 
 	p := proxies(trustedProxies)
 	var handler http.Handler = requestLogging(slog.Default(), p.clientIP, mux)
-	handler = newRateLimiter(10.0/60.0, 10).middleware(p.clientIP, handler)
+	handler = newRateLimiter(float64(rateLimit.PerMinute)/60, rateLimit.Burst).middleware(p.clientIP, handler)
 	handler = p.forwardedHost(handler)
 	return &http.Server{
 		Handler:           handler,

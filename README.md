@@ -30,7 +30,7 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
 - LND backend over gRPC with macaroon authentication
 - Core Lightning backend over CLNRest with rune authentication
 - YAML configuration
-- Request rate limiting
+- Per-client request rate limiting, configurable with `rate_limit`
 - Docker image and Compose file for deployment
 
 ## Requirements

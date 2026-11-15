@@ -166,7 +166,7 @@ func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.
 		}
 		addressHandler = lnurl.NewAddressHandler(cfg.Addresses, node, notify, verifyKey)
 	}
-	return server.New(cfg.TrustedProxies, withdrawHandler, addressHandler), nil
+	return server.New(cfg.TrustedProxies, cfg.RateLimit, withdrawHandler, addressHandler), nil
 }
 
 // serve serves srv on ln until ctx is done, then shuts it down, waiting for

@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 func TestRateLimiter_AllowsNormalTraffic(t *testing.T) {
@@ -95,18 +97,19 @@ func TestRateLimiter_XForwardedFor(t *testing.T) {
 	}
 }
 
-func TestRateLimiter_PrunesIdleVisitors(t *testing.T) {
-	rl := newRateLimiter(1, 1)
-	rl.getLimiter("1.2.3.4")
-	rl.getLimiter("5.6.7.8")
-	rl.limiters["1.2.3.4"].lastSeen = time.Now().Add(-idleTTL - time.Second)
+func TestRateLimiter_PrunesRefilledVisitors(t *testing.T) {
+	rl := newRateLimiter(1.0/3600, 1)
+	rl.limiters["1.2.3.4"] = rate.NewLimiter(rl.rate, rl.burst)
+	if !rl.allow("5.6.7.8") {
+		t.Fatal("first request refused")
+	}
 	rl.lastPrune = time.Now().Add(-pruneInterval - time.Second)
 
-	rl.getLimiter("9.9.9.9")
+	rl.allow("9.9.9.9")
 	if _, ok := rl.limiters["1.2.3.4"]; ok {
-		t.Fatal("idle visitor not pruned")
+		t.Fatal("refilled visitor not pruned")
 	}
-	if len(rl.limiters) != 2 {
-		t.Fatalf("limiters = %d, want 2", len(rl.limiters))
+	if rl.allow("5.6.7.8") {
+		t.Fatal("pruning reset a visitor whose bucket had not refilled")
 	}
 }

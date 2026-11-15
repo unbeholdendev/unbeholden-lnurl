@@ -15,7 +15,7 @@ import (
 )
 
 func TestNew_ShutdownBeforeServe(t *testing.T) {
-	srv := New(nil, nil, nil)
+	srv := New(nil, config.DefaultRateLimit, nil, nil)
 	if err := srv.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestNew_ShutdownBeforeServe(t *testing.T) {
 }
 
 func TestNew_Timeouts(t *testing.T) {
-	srv := New(nil, nil, nil)
+	srv := New(nil, config.DefaultRateLimit, nil, nil)
 	if srv.ReadHeaderTimeout <= 0 || srv.ReadTimeout <= 0 || srv.IdleTimeout <= 0 {
 		t.Fatalf("read header %s, read %s, idle %s: want all set", srv.ReadHeaderTimeout, srv.ReadTimeout, srv.IdleTimeout)
 	}
@@ -92,7 +92,7 @@ func TestNew_ForwardedHostOnlyFromTrustedProxy(t *testing.T) {
 	address := lnurl.NewAddressHandler(map[string]config.AddressEntry{
 		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
 	}, nil, nil, []byte("verify key"))
-	srv := New(trustedProxies(t, "10.0.0.0/8"), nil, address)
+	srv := New(trustedProxies(t, "10.0.0.0/8"), config.DefaultRateLimit, nil, address)
 
 	for remote, want := range map[string]string{
 		"10.0.0.1:1234":    "https://shop.example.com/.well-known/lnurlp/bob/invoice",
