@@ -2,21 +2,22 @@ package lnurl
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
-	"maps"
+	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
+	"unbeholden-lnurl/internal/atomicfile"
 	"unbeholden-lnurl/internal/config"
 	"unbeholden-lnurl/internal/lnd"
-	"unbeholden-lnurl/internal/notifier"
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/lightningnetwork/lnd/zpay32"
@@ -24,24 +25,28 @@ import (
 
 const k1TTL = 5 * time.Minute
 
-type k1Entry struct {
-	voucherID string
-	createdAt time.Time
+// PayTimeout bounds how long a withdraw claim waits for its payment.
+const PayTimeout = 2 * time.Minute
+
+// Payer pays BOLT-11 invoices.
+type Payer interface {
+	// SendPayment pays bolt11. An error wrapping lnd.ErrPaymentFailed means
+	// the payment definitely failed; any other error leaves it unknown.
+	SendPayment(ctx context.Context, bolt11 string, maxFeeSat int64) error
 }
 
 // WithdrawHandler handles LNURL-withdraw protocol requests.
 type WithdrawHandler struct {
-	vouchers    map[string]config.Voucher // id -> voucher
-	tokenToID   map[string]string         // token -> id (for URL lookup)
-	allVouchers []config.Voucher          // ordered list for printing
-	lnd         *lnd.Client
-	ntfy        *notifier.Ntfy
-	statePath   string
+	vouchers  []config.Voucher
+	byToken   map[string]config.Voucher
+	k1Key     []byte
+	network   *chaincfg.Params
+	payer     Payer
+	ntfy      Notifier
+	statePath string
 
-	mu          sync.Mutex
-	claimed     map[string]ClaimedInfo // id -> claim info
-	k1s         map[string]k1Entry     // k1 -> entry with TTL
-	voucherToK1 map[string]string      // voucher id -> active k1 (for eviction)
+	mu      sync.Mutex
+	claimed map[string]ClaimedInfo
 }
 
 // ClaimedInfo records when a voucher was claimed.
@@ -54,239 +59,185 @@ type stateFile struct {
 	Claimed map[string]ClaimedInfo `json:"claimed"`
 }
 
-// NewWithdrawHandler creates a new WithdrawHandler. Returns nil if no vouchers configured.
-func NewWithdrawHandler(vouchers []config.Voucher, lndClient *lnd.Client, ntfy *notifier.Ntfy, statePath string) *WithdrawHandler {
-	if len(vouchers) == 0 {
-		return nil
-	}
+type withdrawRequest struct {
+	Tag                string `json:"tag"`
+	Callback           string `json:"callback"`
+	K1                 string `json:"k1"`
+	DefaultDescription string `json:"defaultDescription"`
+	MinWithdrawable    int64  `json:"minWithdrawable"`
+	MaxWithdrawable    int64  `json:"maxWithdrawable"`
+}
 
-	voucherMap := make(map[string]config.Voucher)
-	tokenToID := make(map[string]string)
-	for _, v := range vouchers {
-		voucherMap[v.ID] = v
-		tokenToID[v.Token] = v.ID
-	}
-
+// NewWithdrawHandler creates a WithdrawHandler that signs k1 values with
+// k1Key, accepts invoices for network and records claims in statePath. It
+// fails if statePath exists but cannot be read. A nil ntfy sends no
+// notifications.
+func NewWithdrawHandler(vouchers []config.Voucher, k1Key []byte, network *chaincfg.Params, payer Payer, ntfy Notifier, statePath string) (*WithdrawHandler, error) {
 	h := &WithdrawHandler{
-		vouchers:    voucherMap,
-		tokenToID:   tokenToID,
-		allVouchers: vouchers,
-		lnd:         lndClient,
-		ntfy:        ntfy,
-		statePath:   statePath,
-		claimed:     make(map[string]ClaimedInfo),
-		k1s:         make(map[string]k1Entry),
-		voucherToK1: make(map[string]string),
+		vouchers:  vouchers,
+		byToken:   make(map[string]config.Voucher, len(vouchers)),
+		k1Key:     k1Key,
+		network:   network,
+		payer:     payer,
+		ntfy:      ntfy,
+		statePath: statePath,
+		claimed:   make(map[string]ClaimedInfo),
 	}
-
+	for _, v := range vouchers {
+		h.byToken[v.Token] = v
+	}
 	if err := h.loadState(); err != nil {
-		log.Printf("withdraw: failed to load state (starting fresh): %v", err)
+		return nil, fmt.Errorf("load withdraw state: %w", err)
 	}
-
-	return h
+	return h, nil
 }
 
 // HandleFirst handles GET /lnurl/withdraw/{token}.
 func (h *WithdrawHandler) HandleFirst(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
-	id, ok := h.tokenToID[token]
+	voucher, ok := h.byToken[token]
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	voucher := h.vouchers[id]
 
 	h.mu.Lock()
-	_, alreadyClaimed := h.claimed[id]
+	_, claimed := h.claimed[voucher.ID]
 	h.mu.Unlock()
-
-	if alreadyClaimed {
+	if claimed {
 		writeError(w, "this voucher has already been claimed")
 		return
 	}
 
-	// Generate k1 (evicts any previous k1 for this voucher)
-	k1 := h.addK1(id)
-
-	resp := map[string]any{
-		"callback":           fmt.Sprintf("https://%s/lnurl/withdraw/%s/claim", publicHost(r), token),
-		"k1":                 k1,
-		"minWithdrawable":    voucher.Amount,
-		"maxWithdrawable":    voucher.Amount,
-		"defaultDescription": voucher.Description,
-		"tag":                "withdrawRequest",
-	}
-	writeJSON(w, resp)
+	writeJSON(w, withdrawRequest{
+		Tag:                "withdrawRequest",
+		Callback:           fmt.Sprintf("https://%s/lnurl/withdraw/%s/claim", r.Host, token),
+		K1:                 hex.EncodeToString(h.signK1(voucher.ID, uint64(time.Now().Add(k1TTL).Unix()))),
+		DefaultDescription: voucher.Description,
+		MinWithdrawable:    voucher.Amount,
+		MaxWithdrawable:    voucher.Amount,
+	})
 }
 
 // HandleClaim handles GET /lnurl/withdraw/{token}/claim?k1=X&pr=X.
 func (h *WithdrawHandler) HandleClaim(w http.ResponseWriter, r *http.Request) {
-	token := r.PathValue("token")
 	k1 := r.URL.Query().Get("k1")
 	pr := r.URL.Query().Get("pr")
-
 	if k1 == "" || pr == "" {
 		writeError(w, "missing k1 or pr parameter")
 		return
 	}
 
-	id, ok := h.tokenToID[token]
+	voucher, ok := h.byToken[r.PathValue("token")]
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	voucher := h.vouchers[id]
-
-	h.mu.Lock()
-	// Validate k1
-	entry, k1Valid := h.k1s[k1]
-	if !k1Valid || entry.voucherID != id {
-		h.mu.Unlock()
-		writeError(w, "invalid k1")
+	if err := h.verifyK1(voucher.ID, k1); err != nil {
+		writeError(w, err.Error())
 		return
 	}
-	if time.Since(entry.createdAt) > k1TTL {
-		delete(h.k1s, k1)
-		if h.voucherToK1[entry.voucherID] == k1 {
-			delete(h.voucherToK1, entry.voucherID)
-		}
-		h.mu.Unlock()
-		writeError(w, "k1 expired, please try again")
-		return
-	}
-	// Check not already claimed
-	if _, alreadyClaimed := h.claimed[id]; alreadyClaimed {
-		h.mu.Unlock()
-		writeError(w, "this voucher has already been claimed")
-		return
-	}
-	// Mark as claimed immediately to prevent double-claim
-	h.claimed[id] = ClaimedInfo{
-		ClaimedAt:  time.Now().UTC(),
-		AmountMsat: voucher.Amount,
-	}
-	delete(h.k1s, k1)
-	delete(h.voucherToK1, id)
-	h.mu.Unlock()
-
-	// Validate the BOLT-11 invoice
-	if err := validateBolt11(pr, voucher.Amount); err != nil {
-		// Undo the claim — invoice was bad
-		h.mu.Lock()
-		delete(h.claimed, id)
-		h.mu.Unlock()
-		log.Printf("withdraw: invalid invoice for voucher %s: %v", id, err)
+	if err := validateBolt11(pr, voucher.Amount, h.network); err != nil {
+		slog.Info("withdraw invoice rejected", "voucher", voucher.ID, "err", err)
 		writeError(w, fmt.Sprintf("invalid invoice: %v", err))
 		return
 	}
 
-	// Pay the invoice (max fee: 1% of amount or 10 sats, whichever is higher)
-	maxFeeSat := max(voucher.Amount/100000, 10) // 1% in sats, minimum 10
-	_, err := h.lnd.SendPayment(r.Context(), pr, maxFeeSat)
-	if err != nil {
-		// Undo the claim on failure
-		h.mu.Lock()
-		delete(h.claimed, id)
+	h.mu.Lock()
+	if _, claimed := h.claimed[voucher.ID]; claimed {
 		h.mu.Unlock()
-		log.Printf("withdraw: payment failed for voucher %s: %v", id, err)
-		writeError(w, "payment failed")
+		writeError(w, "this voucher has already been claimed")
+		return
+	}
+	h.claimed[voucher.ID] = ClaimedInfo{ClaimedAt: time.Now().UTC(), AmountMsat: voucher.Amount}
+	err := h.saveStateLocked()
+	if err != nil {
+		delete(h.claimed, voucher.ID)
+	}
+	h.mu.Unlock()
+	if err != nil {
+		slog.Error("withdraw not paid: failed to save claim", "voucher", voucher.ID, "err", err)
+		writeError(w, "failed to record claim")
 		return
 	}
 
-	// Persist state
-	if err := h.saveState(); err != nil {
-		log.Printf("withdraw: failed to save state: %v", err)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), PayTimeout)
+	defer cancel()
+	maxFeeSat := max(voucher.Amount/100000, 10)
+	err = h.payer.SendPayment(ctx, pr, maxFeeSat)
+	switch {
+	case errors.Is(err, lnd.ErrPaymentFailed):
+		slog.Warn("withdraw payment failed", "voucher", voucher.ID, "err", err)
+		if err := h.release(voucher.ID); err != nil {
+			slog.Error("withdraw release not saved", "voucher", voucher.ID, "err", err)
+		}
+		writeError(w, "payment failed")
+		return
+	case err != nil:
+		slog.Error("withdraw payment outcome unknown, voucher left claimed", "voucher", voucher.ID, "err", err)
+		writeError(w, "payment outcome unknown")
+		return
 	}
 
-	// Notify
-	h.ntfy.NotifyVoucherClaimed(id, voucher.Amount/1000)
-
-	resp := map[string]string{
-		"status": "OK",
+	if h.ntfy != nil {
+		h.ntfy.NotifyVoucherClaimed(voucher.ID, voucher.Amount/1000)
 	}
-	writeJSON(w, resp)
+	writeJSON(w, status{Status: "OK"})
 }
 
-// validateBolt11 decodes a BOLT-11 payment request and validates it against
-// the expected voucher amount. Returns an error if the invoice is invalid,
-// expired, or has a mismatched amount.
-func validateBolt11(payReq string, expectedAmountMsat int64) error {
-	invoice, err := zpay32.Decode(payReq, &chaincfg.MainNetParams)
-	if err != nil {
-		return fmt.Errorf("invalid invoice: %w", err)
-	}
+func (h *WithdrawHandler) release(id string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.claimed, id)
+	return h.saveStateLocked()
+}
 
-	// Check expiry
-	expiry := invoice.Expiry()
-	if time.Since(invoice.Timestamp) > expiry {
-		return fmt.Errorf("invoice has expired")
-	}
+// signK1 returns expiry as big-endian Unix seconds followed by a MAC binding
+// it to the voucher, so claims need no server-side k1 state.
+func (h *WithdrawHandler) signK1(voucherID string, expiry uint64) []byte {
+	b := binary.BigEndian.AppendUint64(make([]byte, 0, 40), expiry)
+	mac := hmac.New(sha256.New, h.k1Key)
+	mac.Write(b)
+	mac.Write([]byte(voucherID))
+	return mac.Sum(b)[:32]
+}
 
-	// Check amount if specified in the invoice
-	if invoice.MilliSat != nil {
-		invoiceAmountMsat := int64(*invoice.MilliSat)
-		if invoiceAmountMsat != expectedAmountMsat {
-			return fmt.Errorf("invoice amount %d msat does not match voucher amount %d msat", invoiceAmountMsat, expectedAmountMsat)
-		}
+func (h *WithdrawHandler) verifyK1(voucherID, k1 string) error {
+	b, err := hex.DecodeString(k1)
+	if err != nil || len(b) != 32 {
+		return errors.New("invalid k1")
 	}
-
+	expiry := binary.BigEndian.Uint64(b)
+	if !hmac.Equal(b, h.signK1(voucherID, expiry)) {
+		return errors.New("invalid k1")
+	}
+	if uint64(time.Now().Unix()) > expiry {
+		return errors.New("k1 expired, please try again")
+	}
 	return nil
 }
 
-func (h *WithdrawHandler) addK1(voucherID string) string {
-	k1Bytes := make([]byte, 32)
-	if _, err := rand.Read(k1Bytes); err != nil {
-		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+// validateBolt11 checks that payReq is an unexpired invoice for network whose
+// amount, if set, is expectedAmountMsat.
+func validateBolt11(payReq string, expectedAmountMsat int64, network *chaincfg.Params) error {
+	invoice, err := zpay32.Decode(payReq, network)
+	if err != nil {
+		return fmt.Errorf("invalid invoice: %w", err)
 	}
-	k1 := hex.EncodeToString(k1Bytes)
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if oldK1, exists := h.voucherToK1[voucherID]; exists {
-		delete(h.k1s, oldK1)
+	if time.Since(invoice.Timestamp) > invoice.Expiry() {
+		return fmt.Errorf("invoice has expired")
 	}
-
-	h.k1s[k1] = k1Entry{
-		voucherID: voucherID,
-		createdAt: time.Now(),
-	}
-	h.voucherToK1[voucherID] = k1
-	return k1
-}
-
-func (h *WithdrawHandler) cleanupExpiredK1s() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	now := time.Now()
-	for k1, entry := range h.k1s {
-		if now.Sub(entry.createdAt) > k1TTL {
-			delete(h.k1s, k1)
-			if h.voucherToK1[entry.voucherID] == k1 {
-				delete(h.voucherToK1, entry.voucherID)
-			}
+	if invoice.MilliSat != nil {
+		if amount := int64(*invoice.MilliSat); amount != expectedAmountMsat {
+			return fmt.Errorf("invoice amount %d msat does not match voucher amount %d msat", amount, expectedAmountMsat)
 		}
 	}
-}
-
-// StartCleanup runs periodic cleanup of expired k1 entries.
-func (h *WithdrawHandler) StartCleanup(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			h.cleanupExpiredK1s()
-		}
-	}
+	return nil
 }
 
 func (h *WithdrawHandler) loadState() error {
 	data, err := os.ReadFile(h.statePath)
-	if os.IsNotExist(err) {
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
@@ -302,29 +253,12 @@ func (h *WithdrawHandler) loadState() error {
 	return nil
 }
 
-func (h *WithdrawHandler) saveState() error {
-	h.mu.Lock()
-	claimed := make(map[string]ClaimedInfo, len(h.claimed))
-	maps.Copy(claimed, h.claimed)
-	h.mu.Unlock()
-
-	state := stateFile{Claimed: claimed}
-
-	data, err := json.MarshalIndent(state, "", "  ")
+func (h *WithdrawHandler) saveStateLocked() error {
+	data, err := json.MarshalIndent(stateFile{Claimed: h.claimed}, "", "  ")
 	if err != nil {
 		return err
 	}
-
-	// Atomic write: write to temp file, then rename
-	dir := filepath.Dir(h.statePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-	tmp := h.statePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, h.statePath)
+	return atomicfile.Write(h.statePath, data)
 }
 
 // UnclaimedVouchers returns all vouchers that have not been claimed, with their full URLs.
@@ -333,7 +267,7 @@ func (h *WithdrawHandler) UnclaimedVouchers() []VoucherStatus {
 	defer h.mu.Unlock()
 
 	var result []VoucherStatus
-	for _, v := range h.allVouchers {
+	for _, v := range h.vouchers {
 		if _, claimed := h.claimed[v.ID]; !claimed {
 			url := fmt.Sprintf("https://%s/lnurl/withdraw/%s", v.Domain, v.Token)
 			lnurl, _ := LNURLEncode(url)

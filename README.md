@@ -64,6 +64,20 @@ Each feature runs only when its section is present: `addresses` for Lightning Ad
 `withdraw` for vouchers, `notifications` for payment notifications. With only
 `notifications`, no HTTP listener is started.
 
+### Behind a reverse proxy
+
+List the proxy's address in `trusted_proxies`. Only requests from a listed address may set
+the client address with `X-Forwarded-For`, used for rate limiting, and the domain with
+`X-Forwarded-Host`. Other requests use the connection's address and `Host`. With Docker's
+port publishing, the proxy's address is usually the gateway of the container's network.
+
+Earlier versions trusted these headers from anyone. Behind a proxy, without
+`trusted_proxies`, all clients now share the proxy's rate limit, and a proxy that does not
+pass the original `Host` serves the wrong domain.
+
+On shutdown the server waits up to 2m10s for requests in flight, so a withdraw payment can
+finish. Give the container at least that long to stop; the Compose file does.
+
 ## Endpoints
 
 | Method | Path | Description |
@@ -80,7 +94,7 @@ Give the server a macaroon with only the permissions its enabled features need, 
 | --- | --- |
 | `addresses` | `invoices:write` |
 | `notifications` | `invoices:read` |
-| `withdraw` | `offchain:write` |
+| `withdraw` | `offchain:write`, `info:read` |
 
 LND's `invoice.macaroon` covers addresses and notifications. Bake others with
 `lncli bakemacaroon`.

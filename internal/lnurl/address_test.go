@@ -89,22 +89,48 @@ func TestHandleWellKnown_DomainFromHost(t *testing.T) {
 	}
 }
 
-func TestHandleWellKnown_ForwardedHost(t *testing.T) {
+func TestHandleInvoice(t *testing.T) {
+	node := &fakeNode{}
 	h := NewAddressHandler(map[string]config.AddressEntry{
 		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
-	}, nil, nil)
+	}, node, node)
 
-	req := httptest.NewRequest("GET", "http://192.168.4.12:7233/.well-known/lnurlp/bob", nil)
-	req.Header.Set("X-Forwarded-Host", "shop.example.com")
+	get := func(query string) map[string]any {
+		req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob/invoice?"+query, nil)
+		req.SetPathValue("username", "bob")
+		rec := httptest.NewRecorder()
+		h.HandleInvoice(rec, req)
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	resp := get("amount=1500&comment=hi")
+	if resp["pr"] != "lnbc-1500-hi" || resp["routes"] == nil {
+		t.Fatalf("response = %v", resp)
+	}
+	if len(node.notified) != 1 || node.notified[0] != "invoice 1 bob@shop.example.com hi" {
+		t.Fatalf("notified = %v", node.notified)
+	}
+	if resp := get("amount=999"); resp["status"] != "ERROR" {
+		t.Fatalf("below min: %v", resp)
+	}
+	if resp := get("amount=1500&comment=" + strings.Repeat("x", maxCommentLen+1)); resp["status"] != "ERROR" {
+		t.Fatalf("long comment: %v", resp)
+	}
+}
+
+func TestHandleInvoice_WithoutNotifier(t *testing.T) {
+	h := NewAddressHandler(map[string]config.AddressEntry{
+		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
+	}, &fakeNode{}, nil)
+	req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob/invoice?amount=1500", nil)
 	req.SetPathValue("username", "bob")
 	rec := httptest.NewRecorder()
-	h.HandleWellKnown(rec, req)
-
-	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatal(err)
-	}
-	if want := "https://shop.example.com/.well-known/lnurlp/bob/invoice"; resp["callback"] != want {
-		t.Errorf("callback = %v, want %s", resp["callback"], want)
+	h.HandleInvoice(rec, req)
+	if !strings.Contains(rec.Body.String(), "lnbc-1500") {
+		t.Fatalf("response = %s", rec.Body.String())
 	}
 }

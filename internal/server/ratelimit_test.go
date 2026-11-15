@@ -4,11 +4,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestRateLimiter_AllowsNormalTraffic(t *testing.T) {
-	rl := newRateLimiter(10.0/60.0, 10) // 10 req/min, burst 10
-	handler := rl.middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	rl := newRateLimiter(10.0/60.0, 10)
+	handler := rl.middleware(proxies(nil).clientIP, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -24,8 +25,8 @@ func TestRateLimiter_AllowsNormalTraffic(t *testing.T) {
 }
 
 func TestRateLimiter_BlocksExcessiveTraffic(t *testing.T) {
-	rl := newRateLimiter(1, 1) // 1 req/s, burst 1
-	handler := rl.middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	rl := newRateLimiter(1, 1)
+	handler := rl.middleware(proxies(nil).clientIP, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -46,7 +47,7 @@ func TestRateLimiter_BlocksExcessiveTraffic(t *testing.T) {
 
 func TestRateLimiter_PerIPIsolation(t *testing.T) {
 	rl := newRateLimiter(1, 1)
-	handler := rl.middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := rl.middleware(proxies(nil).clientIP, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -65,26 +66,47 @@ func TestRateLimiter_PerIPIsolation(t *testing.T) {
 }
 
 func TestRateLimiter_XForwardedFor(t *testing.T) {
-	rl := newRateLimiter(1, 1)
-	handler := rl.middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	req := httptest.NewRequest("GET", "/test", nil)
-	req.RemoteAddr = "10.0.0.1:1234"
-	req.Header.Set("X-Forwarded-For", "203.0.113.50")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("first request: expected 200, got %d", rec.Code)
+	cases := map[string]struct {
+		trusted []string
+		xff     [2]string
+		want    int
+	}{
+		"same client behind trusted proxy":  {[]string{"10.0.0.0/8"}, [2]string{"203.0.113.50", "203.0.113.50"}, http.StatusTooManyRequests},
+		"other client behind trusted proxy": {[]string{"10.0.0.0/8"}, [2]string{"203.0.113.50", "203.0.113.51"}, http.StatusOK},
+		"spoofed from untrusted peer":       {nil, [2]string{"203.0.113.50", "203.0.113.51"}, http.StatusTooManyRequests},
 	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			rl := newRateLimiter(1, 1)
+			handler := rl.middleware(trustedProxies(t, tc.trusted...).clientIP, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+			var code int
+			for _, xff := range tc.xff {
+				req := httptest.NewRequest("GET", "/test", nil)
+				req.RemoteAddr = "10.0.0.1:1234"
+				req.Header.Set("X-Forwarded-For", xff)
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, req)
+				code = rec.Code
+			}
+			if code != tc.want {
+				t.Fatalf("second request: got %d, want %d", code, tc.want)
+			}
+		})
+	}
+}
 
-	req2 := httptest.NewRequest("GET", "/test", nil)
-	req2.RemoteAddr = "10.0.0.1:5678"
-	req2.Header.Set("X-Forwarded-For", "203.0.113.50")
-	rec2 := httptest.NewRecorder()
-	handler.ServeHTTP(rec2, req2)
-	if rec2.Code != http.StatusTooManyRequests {
-		t.Fatalf("second request from same real IP: expected 429, got %d", rec2.Code)
+func TestRateLimiter_PrunesIdleVisitors(t *testing.T) {
+	rl := newRateLimiter(1, 1)
+	rl.getLimiter("1.2.3.4")
+	rl.getLimiter("5.6.7.8")
+	rl.limiters["1.2.3.4"].lastSeen = time.Now().Add(-idleTTL - time.Second)
+	rl.lastPrune = time.Now().Add(-pruneInterval - time.Second)
+
+	rl.getLimiter("9.9.9.9")
+	if _, ok := rl.limiters["1.2.3.4"]; ok {
+		t.Fatal("idle visitor not pruned")
+	}
+	if len(rl.limiters) != 2 {
+		t.Fatalf("limiters = %d, want 2", len(rl.limiters))
 	}
 }

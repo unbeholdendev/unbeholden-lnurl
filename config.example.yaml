@@ -3,6 +3,11 @@
 listen: "0.0.0.0:8080"
 state_dir: "/app/data"
 
+# Reverse proxies in front of this service, as IP addresses or CIDR ranges.
+# X-Forwarded-For and X-Forwarded-Host are honoured only on requests from them.
+trusted_proxies:
+  - "172.16.0.0/12"
+
 lnd:
   host: "lnd:10009"
   tls_cert: "/certs/tls.cert"

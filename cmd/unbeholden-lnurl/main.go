@@ -2,15 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
-	"log"
+	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"unbeholden-lnurl/internal/config"
 	"unbeholden-lnurl/internal/lnd"
@@ -19,84 +23,136 @@ import (
 	"unbeholden-lnurl/internal/server"
 )
 
+const shutdownTimeout = lnurl.PayTimeout + 10*time.Second
+
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
 	healthcheck := flag.Bool("healthcheck", false, "run health check and exit")
 	flag.Parse()
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
+		slog.Error("load config", "err", err)
+		os.Exit(1)
 	}
-
 	if *healthcheck {
-		resp, err := http.Get("http://" + cfg.Listen + "/health")
-		if err != nil || resp.StatusCode != http.StatusOK {
+		if err := checkHealth(cfg.Listen); err != nil {
+			slog.Error("health check", "err", err)
 			os.Exit(1)
 		}
-		os.Exit(0)
+		return
 	}
-	log.Printf("config loaded from %s", *configPath)
+	slog.Info("config loaded", "path", *configPath)
 
-	lndClient, err := lnd.Connect(cfg.LND.Host, cfg.LND.TLSCert, cfg.LND.Macaroon)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	err = run(ctx, cfg)
+	stop()
 	if err != nil {
-		log.Fatalf("failed to connect to lnd: %v", err)
+		slog.Error("stopped", "err", err)
+		os.Exit(1)
 	}
-	defer lndClient.Close()
-	log.Printf("connected to lnd at %s", cfg.LND.Host)
-
-	ntfy := notifier.NewNtfy(cfg.Notifications.Ntfy)
-
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	if cfg.Notifies() {
-		wg.Go(func() {
-			notifier.WatchSettled(ctx, lndClient, filepath.Join(cfg.StateDir, "settle_index"), ntfy)
-		})
-	}
-
-	if cfg.ServesHTTP() {
-		serve(ctx, cfg, lndClient, ntfy)
-	}
-
-	<-ctx.Done()
-	log.Println("shutting down")
-	wg.Wait()
 }
 
-func serve(ctx context.Context, cfg *config.Config, lndClient *lnd.Client, ntfy *notifier.Ntfy) {
-	withdrawHandler := lnurl.NewWithdrawHandler(
-		cfg.ExpandVouchers(),
-		lndClient,
-		ntfy,
-		filepath.Join(cfg.StateDir, "state.json"),
-	)
-	addressHandler := lnurl.NewAddressHandler(cfg.Addresses, lndClient, ntfy)
+func checkHealth(listen string) error {
+	resp, err := http.Get("http://" + listen + "/health")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("health check: status %d", resp.StatusCode)
+	}
+	return nil
+}
 
-	if withdrawHandler != nil {
+func run(ctx context.Context, cfg *config.Config) error {
+	lndClient, err := lnd.Connect(cfg.LND.Host, cfg.LND.TLSCert, cfg.LND.Macaroon)
+	if err != nil {
+		return fmt.Errorf("lnd: %w", err)
+	}
+	defer lndClient.Close()
+	slog.Info("using lnd", "host", cfg.LND.Host)
+
+	var ntfy *notifier.Ntfy
+	// Kept apart from ntfy: a nil *Ntfy in an interface is not a nil Notifier.
+	var notify lnurl.Notifier
+	if n := cfg.Notifications.Ntfy; n != nil {
+		ntfy = notifier.NewNtfy(*n)
+		notify = ntfy
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	if cfg.ServesHTTP() {
+		srv, err := newServer(ctx, cfg, lndClient, notify)
+		if err != nil {
+			return err
+		}
+		ln, err := net.Listen("tcp", cfg.Listen)
+		if err != nil {
+			return err
+		}
+		slog.Info("listening", "addr", ln.Addr().String())
+		g.Go(func() error { return serve(ctx, srv, ln) })
+	}
+	if ntfy != nil {
+		g.Go(func() error {
+			notifier.WatchSettled(ctx, lndClient, filepath.Join(cfg.StateDir, "settle_index"), ntfy)
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+func newServer(ctx context.Context, cfg *config.Config, lndClient *lnd.Client, notify lnurl.Notifier) (*http.Server, error) {
+	var withdrawHandler *lnurl.WithdrawHandler
+	if len(cfg.Withdraw) > 0 {
+		network, err := lndClient.Network(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("get lnd network: %w", err)
+		}
+		withdrawHandler, err = lnurl.NewWithdrawHandler(
+			cfg.ExpandVouchers(),
+			cfg.WithdrawK1Key(),
+			network,
+			lndClient,
+			notify,
+			filepath.Join(cfg.StateDir, "state.json"),
+		)
+		if err != nil {
+			return nil, err
+		}
 		unclaimed := withdrawHandler.UnclaimedVouchers()
-		log.Printf("withdraw vouchers: %d unclaimed", len(unclaimed))
+		slog.Info("withdraw vouchers", "unclaimed", len(unclaimed))
 		for _, v := range unclaimed {
-			log.Printf("  %s (%d sats) %s", v.ID, v.Amount/1000, v.URL)
-			log.Printf("    %s", v.LNURL)
+			slog.Info("unclaimed voucher", "id", v.ID, "sats", v.Amount/1000, "url", v.URL, "lnurl", v.LNURL)
 		}
-		go withdrawHandler.StartCleanup(ctx)
 	}
-
-	srv := server.New(cfg, withdrawHandler, addressHandler)
-
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer shutdownCancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("shutdown error: %v", err)
-		}
-	}()
-
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server error: %v", err)
+	var addressHandler *lnurl.AddressHandler
+	if len(cfg.Addresses) > 0 {
+		addressHandler = lnurl.NewAddressHandler(cfg.Addresses, lndClient, notify)
 	}
+	return server.New(cfg.TrustedProxies, withdrawHandler, addressHandler), nil
+}
+
+// serve serves srv on ln until ctx is done, then shuts it down, waiting for
+// requests in flight, such as a withdraw payment.
+func serve(ctx context.Context, srv *http.Server, ln net.Listener) error {
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+	}
+	slog.Info("shutting down", "wait_for_requests", shutdownTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
+	if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }

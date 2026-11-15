@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"io/fs"
-	"log"
+	"log/slog"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"unbeholden-lnurl/internal/atomicfile"
 )
 
 // Invoices is the part of the LND client WatchSettled needs.
@@ -40,7 +41,7 @@ func WatchSettled(ctx context.Context, invoices Invoices, statePath string, n *N
 		if time.Since(start) > time.Minute {
 			backoff = 1 * time.Second
 		}
-		log.Printf("invoice subscriber stopped: %v, retrying in %s...", err, backoff)
+		slog.Warn("invoice subscriber stopped", "err", err, "retry_in", backoff)
 		select {
 		case <-ctx.Done():
 			return
@@ -62,10 +63,10 @@ func watchOnce(ctx context.Context, invoices Invoices, statePath string, n *Ntfy
 		return err
 	}
 
-	log.Printf("invoice subscriber: starting after settle index %d", from)
+	slog.Info("invoice subscriber starting", "after_settle_index", from)
 	return invoices.SubscribeInvoices(ctx, from, func(amountMsat int64, memo string, resumeFrom uint64) error {
 		amountSats := amountMsat / 1000
-		log.Printf("invoice settled: %d sats", amountSats)
+		slog.Info("invoice settled", "sats", amountSats)
 		if err := n.NotifyPayment(amountSats, memo); err != nil {
 			return err
 		}
@@ -82,12 +83,5 @@ func loadSettleIndex(path string) (uint64, error) {
 }
 
 func saveSettleIndex(path string, index uint64) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strconv.FormatUint(index, 10)+"\n"), 0600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return atomicfile.Write(path, []byte(strconv.FormatUint(index, 10)+"\n"))
 }

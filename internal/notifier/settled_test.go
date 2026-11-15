@@ -61,7 +61,7 @@ func ntfyServer(t *testing.T, fail func(body string) bool) (*Ntfy, *[]string) {
 		mu.Unlock()
 	}))
 	t.Cleanup(srv.Close)
-	return NewNtfy(&config.NtfyConfig{URL: srv.URL, Topic: "t"}), &delivered
+	return NewNtfy(config.NtfyConfig{URL: srv.URL, Topic: "t"}), &delivered
 }
 
 func TestWatchSettled_FirstStartSkipsHistoryAndRecordsBaseline(t *testing.T) {

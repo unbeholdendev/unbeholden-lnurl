@@ -2,68 +2,61 @@ package server
 
 import (
 	"bytes"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
-func TestRequestLogging_LogsRequestDetails(t *testing.T) {
+func logRequest(t *testing.T, pattern, method, target string, status int) string {
+	t.Helper()
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	mux := http.NewServeMux()
+	mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+	})
+	handler := requestLogging(slog.New(slog.NewTextHandler(&buf, nil)), proxies(nil).clientIP, mux)
 
-	handler := requestLogging(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	}))
-
-	req := httptest.NewRequest("GET", "/health", nil)
+	req := httptest.NewRequest(method, target, nil)
 	req.RemoteAddr = "1.2.3.4:5678"
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	return buf.String()
+}
 
-	logLine := buf.String()
-	if !strings.Contains(logLine, "GET") {
-		t.Errorf("log should contain method, got: %s", logLine)
-	}
-	if !strings.Contains(logLine, "/health") {
-		t.Errorf("log should contain path, got: %s", logLine)
-	}
-	if !strings.Contains(logLine, "200") {
-		t.Errorf("log should contain status code, got: %s", logLine)
-	}
-	if !strings.Contains(logLine, "1.2.3.4") {
-		t.Errorf("log should contain client IP, got: %s", logLine)
+func TestRequestLogging_LogsRequestDetails(t *testing.T) {
+	line := logRequest(t, "GET /health", "GET", "/health", http.StatusOK)
+	for _, want := range []string{"method=GET", "path=/health", "status=200", "duration=", "client=1.2.3.4"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("log should contain %s, got: %s", want, line)
+		}
 	}
 }
 
 func TestRequestLogging_CapturesNon200Status(t *testing.T) {
-	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	if line := logRequest(t, "GET /missing", "GET", "/missing", http.StatusNotFound); !strings.Contains(line, "status=404") {
+		t.Errorf("log should contain 404 status, got: %s", line)
+	}
+}
 
-	handler := requestLogging(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-
-	req := httptest.NewRequest("GET", "/missing", nil)
-	req.RemoteAddr = "1.2.3.4:5678"
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	logLine := buf.String()
-	if !strings.Contains(logLine, "404") {
-		t.Errorf("log should contain 404 status, got: %s", logLine)
+func TestRequestLogging_HidesVoucherToken(t *testing.T) {
+	const pattern = "GET /lnurl/withdraw/{token}/claim"
+	for _, tc := range []struct{ method, target, want string }{
+		{"GET", "/lnurl/withdraw/0123abcd/claim?k1=ff", "path=/lnurl/withdraw/{token}/claim"},
+		{"POST", "/lnurl/withdraw/0123abcd/claim", "path=/lnurl/withdraw/{token}/claim"},
+		{"GET", "/lnurl/withdraw/0123abcd", "path=/lnurl/withdraw/{token}"},
+		{"GET", "/lnurl/withdraw/0123abcd/claim/extra", "path=/lnurl/withdraw/{token}/claim/extra"},
+	} {
+		line := logRequest(t, pattern, tc.method, tc.target, http.StatusOK)
+		if strings.Contains(line, "0123abcd") || strings.Contains(line, "k1") || !strings.Contains(line, tc.want+" ") {
+			t.Errorf("%s %s: log should hide the token, got: %s", tc.method, tc.target, line)
+		}
 	}
 }
 
 func TestStatusResponseWriter_DefaultStatus(t *testing.T) {
-	rec := httptest.NewRecorder()
-	rw := &statusResponseWriter{ResponseWriter: rec}
-
-	// Write body without calling WriteHeader — should default to 200
+	rw := &statusResponseWriter{ResponseWriter: httptest.NewRecorder()}
 	rw.Write([]byte("hello"))
-
 	if rw.statusCode() != http.StatusOK {
 		t.Errorf("expected default status 200, got %d", rw.statusCode())
 	}

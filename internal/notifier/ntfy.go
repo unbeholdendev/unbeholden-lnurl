@@ -3,7 +3,7 @@ package notifier
 import (
 	"bytes"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -18,11 +18,8 @@ type Ntfy struct {
 	client *http.Client
 }
 
-// NewNtfy creates a new Ntfy notifier from config. Returns nil if ntfy is not configured.
-func NewNtfy(cfg *config.NtfyConfig) *Ntfy {
-	if cfg == nil {
-		return nil
-	}
+// NewNtfy creates an Ntfy notifier.
+func NewNtfy(cfg config.NtfyConfig) *Ntfy {
 	return &Ntfy{
 		url:   cfg.URL,
 		topic: cfg.Topic,
@@ -35,9 +32,6 @@ func NewNtfy(cfg *config.NtfyConfig) *Ntfy {
 
 // NotifyInvoiceCreated sends a notification when an invoice is created.
 func (n *Ntfy) NotifyInvoiceCreated(amountSats int64, address string, comment string) {
-	if n == nil {
-		return
-	}
 	body := fmt.Sprintf("Invoice created: %d sats for %s", amountSats, address)
 	if comment != "" {
 		body = fmt.Sprintf("Invoice created: %d sats for %s: %s", amountSats, address, comment)
@@ -47,9 +41,6 @@ func (n *Ntfy) NotifyInvoiceCreated(amountSats int64, address string, comment st
 
 // NotifyPayment sends a notification for a settled payment.
 func (n *Ntfy) NotifyPayment(amountSats int64, memo string) error {
-	if n == nil {
-		return nil
-	}
 	body := fmt.Sprintf("Received %d sats", amountSats)
 	if memo != "" {
 		body = fmt.Sprintf("Received %d sats: %s", amountSats, memo)
@@ -59,9 +50,6 @@ func (n *Ntfy) NotifyPayment(amountSats int64, memo string) error {
 
 // NotifyVoucherClaimed sends a notification for a claimed withdraw voucher.
 func (n *Ntfy) NotifyVoucherClaimed(voucherID string, amountSats int64) {
-	if n == nil {
-		return
-	}
 	body := fmt.Sprintf("Voucher %s claimed (%d sats)", voucherID, amountSats)
 	n.sendOrLog("Voucher claimed", body)
 }
@@ -91,6 +79,6 @@ func (n *Ntfy) send(title, body string) error {
 
 func (n *Ntfy) sendOrLog(title, body string) {
 	if err := n.send(title, body); err != nil {
-		log.Print(err)
+		slog.Warn("notification failed", "title", title, "err", err)
 	}
 }

@@ -14,4 +14,5 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
+    stop_grace_period: 2m30s
     restart: unless-stopped

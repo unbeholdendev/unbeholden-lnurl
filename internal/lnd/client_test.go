@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"google.golang.org/grpc"
 )
 
@@ -16,6 +17,7 @@ type fakeLightning struct {
 	listed    []*lnrpc.Invoice
 	streamed  []*lnrpc.Invoice
 	streamCtx context.Context
+	network   string
 }
 
 func (f *fakeLightning) ListInvoices(_ context.Context, req *lnrpc.ListInvoiceRequest, _ ...grpc.CallOption) (*lnrpc.ListInvoiceResponse, error) {
@@ -95,5 +97,67 @@ func TestSubscribeInvoices_CallbackErrorCancelsStream(t *testing.T) {
 	}
 	if f.streamCtx.Err() == nil {
 		t.Fatal("stream context still live after SubscribeInvoices returned")
+	}
+}
+
+type fakeRouter struct {
+	routerrpc.RouterClient
+	updates []*lnrpc.Payment
+	err     error
+}
+
+func (f *fakeRouter) SendPaymentV2(context.Context, *routerrpc.SendPaymentRequest, ...grpc.CallOption) (routerrpc.Router_SendPaymentV2Client, error) {
+	return &fakePaymentStream{updates: f.updates, err: f.err}, nil
+}
+
+type fakePaymentStream struct {
+	grpc.ClientStream
+	updates []*lnrpc.Payment
+	err     error
+}
+
+func (s *fakePaymentStream) Recv() (*lnrpc.Payment, error) {
+	if len(s.updates) == 0 {
+		return nil, s.err
+	}
+	p := s.updates[0]
+	s.updates = s.updates[1:]
+	return p, nil
+}
+
+func TestSendPayment_Outcomes(t *testing.T) {
+	inFlight := &lnrpc.Payment{Status: lnrpc.Payment_IN_FLIGHT}
+	cases := map[string]struct {
+		router     *fakeRouter
+		wantErr    bool
+		wantFailed bool
+	}{
+		"succeeded":    {router: &fakeRouter{updates: []*lnrpc.Payment{inFlight, {Status: lnrpc.Payment_SUCCEEDED}}}},
+		"failed":       {router: &fakeRouter{updates: []*lnrpc.Payment{inFlight, {Status: lnrpc.Payment_FAILED}}}, wantErr: true, wantFailed: true},
+		"stream error": {router: &fakeRouter{updates: []*lnrpc.Payment{inFlight}, err: io.ErrUnexpectedEOF}, wantErr: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := (&Client{router: tc.router}).SendPayment(context.Background(), "lnbc", 10)
+			if (err != nil) != tc.wantErr || errors.Is(err, ErrPaymentFailed) != tc.wantFailed {
+				t.Fatalf("err = %v, want error %v, definite failure %v", err, tc.wantErr, tc.wantFailed)
+			}
+		})
+	}
+}
+
+func (f *fakeLightning) GetInfo(context.Context, *lnrpc.GetInfoRequest, ...grpc.CallOption) (*lnrpc.GetInfoResponse, error) {
+	return &lnrpc.GetInfoResponse{Chains: []*lnrpc.Chain{{Network: f.network}}}, nil
+}
+
+func TestNetwork(t *testing.T) {
+	for network, want := range map[string]string{"mainnet": "mainnet", "testnet": "testnet3", "signet": "signet", "regtest": "regtest"} {
+		params, err := (&Client{lightning: &fakeLightning{network: network}}).Network(context.Background())
+		if err != nil || params.Name != want {
+			t.Errorf("Network() for %s = %v, %v; want %s", network, params, err, want)
+		}
+	}
+	if _, err := (&Client{lightning: &fakeLightning{network: "litecoin"}}).Network(context.Background()); err == nil {
+		t.Error("expected error for unknown network")
 	}
 }

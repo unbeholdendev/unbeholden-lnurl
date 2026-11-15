@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -136,4 +137,53 @@ func writeTestConfig(t *testing.T, content string) string {
 		t.Fatalf("write config: %v", err)
 	}
 	return path
+}
+
+func TestWithdrawK1Key_DiffersFromTokens(t *testing.T) {
+	cfg := Config{WithdrawSecret: "0123456789abcdef0123456789abcdef"}
+	key := hex.EncodeToString(cfg.WithdrawK1Key())
+	if len(key) != 64 {
+		t.Fatalf("key length = %d hex chars, want 64", len(key))
+	}
+	if tokenForVoucher(cfg.WithdrawSecret, "unbeholden-lnurl withdraw k1") == key[:32] {
+		t.Fatal("k1 key equals a voucher token")
+	}
+	other := Config{WithdrawSecret: "fedcba9876543210fedcba9876543210"}
+	if hex.EncodeToString(other.WithdrawK1Key()) == key {
+		t.Fatal("k1 key does not depend on the secret")
+	}
+}
+
+func TestLoad_TrustedProxies(t *testing.T) {
+	cfg, err := Load(writeTestConfig(t, lndYAML+`
+state_dir: "/var/lib/x"
+notifications:
+  ntfy:
+    url: "https://ntfy.example.com"
+    topic: "t"
+trusted_proxies: ["10.0.0.0/8", "192.0.2.7", "::ffff:198.51.100.1", "fd00::/8"]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, p := range cfg.TrustedProxies {
+		got = append(got, p.String())
+	}
+	if want := []string{"10.0.0.0/8", "192.0.2.7/32", "198.51.100.1/32", "fd00::/8"}; !slices.Equal(got, want) {
+		t.Fatalf("trusted proxies = %v, want %v", got, want)
+	}
+
+	for _, bad := range []string{"proxy.example.com", "10.0.0.0/33", ""} {
+		if _, err := Load(writeTestConfig(t, lndYAML+`
+state_dir: "/var/lib/x"
+notifications:
+  ntfy:
+    url: "https://ntfy.example.com"
+    topic: "t"
+trusted_proxies: ["`+bad+`"]
+`)); err == nil {
+			t.Errorf("trusted proxy %q accepted", bad)
+		}
+	}
 }

@@ -1,56 +1,58 @@
 package lnurl
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 
 	"unbeholden-lnurl/internal/config"
-	"unbeholden-lnurl/internal/lnd"
-	"unbeholden-lnurl/internal/notifier"
 )
+
+const maxCommentLen = 140
+
+// Invoicer creates invoices.
+type Invoicer interface {
+	AddInvoice(ctx context.Context, amountMsat int64, descriptionHash []byte, memo string) (string, error)
+}
 
 // AddressHandler handles Lightning Address (LUD-16) requests.
 type AddressHandler struct {
 	addresses map[string]config.AddressEntry
-	wildcard  *config.AddressEntry // catch-all for unknown usernames
-	lnd       *lnd.Client
-	ntfy      *notifier.Ntfy
+	invoicer  Invoicer
+	ntfy      Notifier
 }
 
-// NewAddressHandler creates a new AddressHandler. Returns nil if no addresses configured.
-func NewAddressHandler(addresses map[string]config.AddressEntry, lndClient *lnd.Client, ntfy *notifier.Ntfy) *AddressHandler {
-	if len(addresses) == 0 {
-		return nil
-	}
-
-	h := &AddressHandler{
-		addresses: addresses,
-		lnd:       lndClient,
-		ntfy:      ntfy,
-	}
-
-	// Extract wildcard entry if present
-	if wc, ok := addresses["*"]; ok {
-		h.wildcard = &wc
-	}
-
-	return h
+type payRequest struct {
+	Tag            string `json:"tag"`
+	Callback       string `json:"callback"`
+	Metadata       string `json:"metadata"`
+	MinSendable    int64  `json:"minSendable"`
+	MaxSendable    int64  `json:"maxSendable"`
+	CommentAllowed int    `json:"commentAllowed"`
 }
 
-// resolveAddress looks up the address entry for a username.
-// Explicit entries take priority over the wildcard.
+type invoiceResponse struct {
+	PR     string     `json:"pr"`
+	Routes []struct{} `json:"routes"`
+}
+
+// NewAddressHandler creates an AddressHandler. The "*" entry, if present,
+// serves every username without an entry of its own. A nil ntfy sends no
+// notifications.
+func NewAddressHandler(addresses map[string]config.AddressEntry, invoicer Invoicer, ntfy Notifier) *AddressHandler {
+	return &AddressHandler{addresses: addresses, invoicer: invoicer, ntfy: ntfy}
+}
+
 func (h *AddressHandler) resolveAddress(username string) (config.AddressEntry, bool) {
-	if addr, ok := h.addresses[username]; ok && username != "*" {
+	if addr, ok := h.addresses[username]; ok {
 		return addr, true
 	}
-	if h.wildcard != nil {
-		return *h.wildcard, true
-	}
-	return config.AddressEntry{}, false
+	addr, ok := h.addresses["*"]
+	return addr, ok
 }
 
 // HandleWellKnown handles GET /.well-known/lnurlp/{username}.
@@ -62,17 +64,14 @@ func (h *AddressHandler) HandleWellKnown(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	metadata := addressMetadata(addr.Description, username, publicHost(r))
-
-	resp := map[string]any{
-		"callback":       fmt.Sprintf("https://%s/.well-known/lnurlp/%s/invoice", publicHost(r), username),
-		"minSendable":    addr.MinSendable,
-		"maxSendable":    addr.MaxSendable,
-		"metadata":       metadata,
-		"commentAllowed": 140,
-		"tag":            "payRequest",
-	}
-	writeJSON(w, resp)
+	writeJSON(w, payRequest{
+		Tag:            "payRequest",
+		Callback:       fmt.Sprintf("https://%s/.well-known/lnurlp/%s/invoice", r.Host, username),
+		Metadata:       addressMetadata(addr.Description, username, r.Host),
+		MinSendable:    addr.MinSendable,
+		MaxSendable:    addr.MaxSendable,
+		CommentAllowed: maxCommentLen,
+	})
 }
 
 // HandleInvoice handles GET /.well-known/lnurlp/{username}/invoice?amount=X.
@@ -99,44 +98,33 @@ func (h *AddressHandler) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read optional sender comment (LUD-12)
 	comment := r.URL.Query().Get("comment")
-	if len(comment) > 140 {
-		writeError(w, "comment too long (max 140 characters)")
+	if len(comment) > maxCommentLen {
+		writeError(w, fmt.Sprintf("comment too long (max %d characters)", maxCommentLen))
 		return
 	}
 
-	metadata := addressMetadata(addr.Description, username, publicHost(r))
-	descHash := sha256.Sum256([]byte(metadata))
-
-	bolt11, err := h.lnd.AddInvoice(r.Context(), amountMsat, descHash[:], comment)
+	descHash := sha256.Sum256([]byte(addressMetadata(addr.Description, username, r.Host)))
+	bolt11, err := h.invoicer.AddInvoice(r.Context(), amountMsat, descHash[:], comment)
 	if err != nil {
-		log.Printf("lightning-address: add invoice failed for %s: %v", username, err)
+		slog.Error("add invoice failed", "username", username, "err", err)
 		writeError(w, "failed to create invoice")
 		return
 	}
 
-	// Notify on invoice creation
-	address := fmt.Sprintf("%s@%s", username, publicHost(r))
-	h.ntfy.NotifyInvoiceCreated(amountMsat/1000, address, comment)
-	log.Printf("invoice created: %d sats for %s", amountMsat/1000, address)
-
-	resp := map[string]any{
-		"pr":     bolt11,
-		"routes": []any{},
+	address := fmt.Sprintf("%s@%s", username, r.Host)
+	if h.ntfy != nil {
+		h.ntfy.NotifyInvoiceCreated(amountMsat/1000, address, comment)
 	}
-	writeJSON(w, resp)
+	slog.Info("invoice created", "sats", amountMsat/1000, "address", address)
+
+	writeJSON(w, invoiceResponse{PR: bolt11, Routes: []struct{}{}})
 }
 
 func addressMetadata(description, username, host string) string {
-	metadata := [][]string{
+	data, _ := json.Marshal([][]string{
 		{"text/plain", description},
 		{"text/identifier", fmt.Sprintf("%s@%s", username, host)},
-	}
-	data, err := json.Marshal(metadata)
-	if err != nil {
-		// This should never happen with string data
-		return fmt.Sprintf(`[["text/plain","%s"],["text/identifier","%s@%s"]]`, description, username, host)
-	}
+	})
 	return string(data)
 }

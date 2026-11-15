@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
 
+	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"google.golang.org/grpc"
@@ -25,7 +27,6 @@ type Client struct {
 
 // Connect establishes a gRPC connection to LND using TLS and macaroon auth.
 func Connect(host, tlsCertPath, macaroonPath string) (*Client, error) {
-	// Load TLS cert
 	tlsCert, err := os.ReadFile(tlsCertPath)
 	if err != nil {
 		return nil, fmt.Errorf("read tls cert: %w", err)
@@ -36,7 +37,6 @@ func Connect(host, tlsCertPath, macaroonPath string) (*Client, error) {
 	}
 	tlsCreds := credentials.NewClientTLSFromCert(certPool, "")
 
-	// Load macaroon
 	macBytes, err := os.ReadFile(macaroonPath)
 	if err != nil {
 		return nil, fmt.Errorf("read macaroon: %w", err)
@@ -46,7 +46,6 @@ func Connect(host, tlsCertPath, macaroonPath string) (*Client, error) {
 		return nil, fmt.Errorf("unmarshal macaroon: %w", err)
 	}
 
-	// Connect
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(tlsCreds),
 		grpc.WithPerRPCCredentials(&macaroonCredential{mac: mac}),
@@ -84,8 +83,14 @@ func (c *Client) AddInvoice(ctx context.Context, amountMsat int64, descriptionHa
 	return resp.PaymentRequest, nil
 }
 
-// SendPayment pays a BOLT-11 invoice. Returns the payment preimage on success.
-func (c *Client) SendPayment(ctx context.Context, bolt11 string, maxFeeSat int64) (string, error) {
+// ErrPaymentFailed is returned by SendPayment when LND reports the payment
+// as failed, so no part of it can still settle.
+var ErrPaymentFailed = errors.New("payment failed")
+
+// SendPayment pays a BOLT-11 invoice. An error wrapping ErrPaymentFailed means
+// the payment definitely failed; any other error leaves the outcome unknown.
+// Cancelling ctx stops waiting but does not stop the payment.
+func (c *Client) SendPayment(ctx context.Context, bolt11 string, maxFeeSat int64) error {
 	stream, err := c.router.SendPaymentV2(ctx, &routerrpc.SendPaymentRequest{
 		PaymentRequest: bolt11,
 		TimeoutSeconds: 60,
@@ -93,21 +98,47 @@ func (c *Client) SendPayment(ctx context.Context, bolt11 string, maxFeeSat int64
 		MaxParts:       16,
 	})
 	if err != nil {
-		return "", fmt.Errorf("send payment: %w", err)
+		return fmt.Errorf("send payment: %w", err)
 	}
 
 	for {
 		payment, err := stream.Recv()
 		if err != nil {
-			return "", fmt.Errorf("recv payment update: %w", err)
+			return fmt.Errorf("recv payment update: %w", err)
 		}
 		switch payment.Status {
 		case lnrpc.Payment_SUCCEEDED:
-			return payment.PaymentPreimage, nil
+			return nil
 		case lnrpc.Payment_FAILED:
-			return "", fmt.Errorf("payment failed: %s", payment.FailureReason)
-			// IN_FLIGHT: continue waiting
+			return fmt.Errorf("%w: %s", ErrPaymentFailed, payment.FailureReason)
 		}
+	}
+}
+
+// Network returns the parameters of the chain LND runs on.
+func (c *Client) Network(ctx context.Context) (*chaincfg.Params, error) {
+	info, err := c.lightning.GetInfo(ctx, &lnrpc.GetInfoRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("get info: %w", err)
+	}
+	if len(info.Chains) == 0 {
+		return nil, fmt.Errorf("get info: no chain reported")
+	}
+	switch network := info.Chains[0].Network; network {
+	case "mainnet":
+		return &chaincfg.MainNetParams, nil
+	case "testnet":
+		return &chaincfg.TestNet3Params, nil
+	case "testnet4":
+		return &chaincfg.TestNet4Params, nil
+	case "signet":
+		return &chaincfg.SigNetParams, nil
+	case "regtest":
+		return &chaincfg.RegressionNetParams, nil
+	case "simnet":
+		return &chaincfg.SimNetParams, nil
+	default:
+		return nil, fmt.Errorf("unsupported network %q", network)
 	}
 }
 

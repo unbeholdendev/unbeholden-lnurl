@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 
@@ -13,12 +14,31 @@ import (
 
 type Config struct {
 	Listen         string                  `yaml:"listen,omitempty"`
+	TrustedProxies []Prefix                `yaml:"trusted_proxies,omitempty"`
 	LND            LNDConfig               `yaml:"lnd"`
 	StateDir       string                  `yaml:"state_dir,omitempty"`
 	Notifications  NotificationsConfig     `yaml:"notifications,omitempty"`
 	WithdrawSecret string                  `yaml:"withdraw_secret,omitempty"`
 	Withdraw       []WithdrawConfig        `yaml:"withdraw,omitempty"`
 	Addresses      map[string]AddressEntry `yaml:"addresses,omitempty"`
+}
+
+// Prefix is an IP address range, written as CIDR or as a single address.
+type Prefix struct{ netip.Prefix }
+
+func (p *Prefix) UnmarshalText(text []byte) error {
+	s := string(text)
+	prefix, err := netip.ParsePrefix(s)
+	if err != nil {
+		addr, addrErr := netip.ParseAddr(s)
+		if addrErr != nil {
+			return fmt.Errorf("trusted_proxies: %q is not an IP address or CIDR range", s)
+		}
+		addr = addr.Unmap()
+		prefix = netip.PrefixFrom(addr, addr.BitLen())
+	}
+	p.Prefix = prefix.Masked()
+	return nil
 }
 
 type LNDConfig struct {
@@ -39,12 +59,9 @@ type NtfyConfig struct {
 }
 
 type WithdrawConfig struct {
-	// Single voucher fields
-	ID string `yaml:"id,omitempty"`
-	// Batch fields
-	Prefix string `yaml:"prefix,omitempty"`
-	Count  int    `yaml:"count,omitempty"`
-	// Common fields
+	ID          string `yaml:"id,omitempty"`
+	Prefix      string `yaml:"prefix,omitempty"`
+	Count       int    `yaml:"count,omitempty"`
 	Domain      string `yaml:"domain"`
 	Description string `yaml:"description"`
 	Amount      int64  `yaml:"amount"`
@@ -73,6 +90,14 @@ func tokenForVoucher(secret, id string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(id))
 	return hex.EncodeToString(mac.Sum(nil)[:16])
+}
+
+// WithdrawK1Key returns the key for signing withdraw k1 values. It is keyed
+// differently from voucher tokens, so a token never reveals it.
+func (c *Config) WithdrawK1Key() []byte {
+	mac := hmac.New(sha256.New, []byte("unbeholden-lnurl withdraw k1"))
+	mac.Write([]byte(c.WithdrawSecret))
+	return mac.Sum(nil)
 }
 
 func Load(path string) (*Config, error) {
