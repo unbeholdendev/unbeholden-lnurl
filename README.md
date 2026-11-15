@@ -72,6 +72,11 @@ Each feature runs only when its section is present: `addresses` for Lightning Ad
 `withdraw` for vouchers, `notifications` for payment notifications, `nostr` for zaps. With
 only `notifications`, no HTTP listener is started.
 
+Payment notifications and zap receipts track settlements independently, so ntfy failures
+retry without blocking later zap receipts. Keep `settle_index` and `zap_settle_index`
+in `state_dir` across restarts. On upgrade, the zap cursor starts from the existing
+`settle_index` before the HTTP listener starts.
+
 ### Payment verification
 
 Set `verify_key_file` to keep LUD-21 verify URLs valid when the node's macaroon or rune

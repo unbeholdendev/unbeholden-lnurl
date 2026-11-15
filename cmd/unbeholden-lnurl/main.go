@@ -154,10 +154,16 @@ func run(ctx context.Context, cfg *config.Config) error {
 		slog.Info("zaps enabled", "nostr_pubkey", zapper.PubKey())
 	}
 
-	if ntfy != nil || zapper != nil {
-		if err := notifier.InitSettled(ctx, node, filepath.Join(cfg.StateDir, "settle_index")); err != nil {
-			return fmt.Errorf("initialise settlement tracking: %w", err)
-		}
+	var payment, receipt func(lightning.Settled) error
+	if ntfy != nil {
+		payment = ntfy.NotifyPayment
+	}
+	if zapper != nil {
+		receipt = func(invoice lightning.Settled) error { return zapper.Settled(ctx, invoice) }
+	}
+	watchers, err := prepareSettlements(ctx, node, cfg.StateDir, payment, receipt)
+	if err != nil {
+		return fmt.Errorf("initialise settlement tracking: %w", err)
 	}
 	g, ctx := errgroup.WithContext(ctx)
 	if cfg.ServesHTTP() {
@@ -186,22 +192,9 @@ func run(ctx context.Context, cfg *config.Config) error {
 			}
 		})
 	}
-	if ntfy != nil || zapper != nil {
-		onSettled := func(invoice lightning.Settled) error {
-			if zapper != nil {
-				if err := zapper.Settled(ctx, invoice); err != nil {
-					return err
-				}
-			}
-			if ntfy != nil {
-				return ntfy.NotifyPayment(invoice)
-			}
-			return nil
-		}
+	for _, watcher := range watchers {
 		g.Go(func() error {
-			// Named before Core Lightning support; a new name would lose the
-			// position of existing deployments.
-			notifier.WatchSettled(ctx, node, filepath.Join(cfg.StateDir, "settle_index"), onSettled)
+			notifier.WatchSettled(ctx, node, watcher.path, watcher.handle)
 			return nil
 		})
 	}
@@ -265,4 +258,31 @@ func serve(ctx context.Context, srv *http.Server, ln net.Listener) error {
 		return err
 	}
 	return nil
+}
+
+type settlementWatcher struct {
+	path   string
+	handle func(lightning.Settled) error
+}
+
+func prepareSettlements(ctx context.Context, invoices notifier.Invoices, dir string, payment, receipt func(lightning.Settled) error) ([]settlementWatcher, error) {
+	if payment == nil && receipt == nil {
+		return nil, nil
+	}
+	path := filepath.Join(dir, "settle_index")
+	if err := notifier.InitSettled(ctx, invoices, path); err != nil {
+		return nil, err
+	}
+	var watchers []settlementWatcher
+	if receipt != nil {
+		zapPath := filepath.Join(dir, "zap_settle_index")
+		if err := notifier.ForkSettled(zapPath, path); err != nil {
+			return nil, err
+		}
+		watchers = append(watchers, settlementWatcher{zapPath, receipt})
+	}
+	if payment != nil {
+		watchers = append(watchers, settlementWatcher{path, payment})
+	}
+	return watchers, nil
 }

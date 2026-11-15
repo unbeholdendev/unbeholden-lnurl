@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -192,5 +193,42 @@ func TestSettledSharedPositionRetriesFirstDelivery(t *testing.T) {
 	}
 	if index != 0 {
 		t.Fatalf("position = %d, want 0 after failed delivery", index)
+	}
+}
+
+func TestForkSettled(t *testing.T) {
+	for _, tc := range []struct {
+		name, previous, current, want string
+		fail                          bool
+	}{
+		{"migration", "4\n", "", "4\n", false},
+		{"preserve newer", "4\n", "9\n", "9\n", false},
+		{"preserve older", "9\n", "4\n", "4\n", false},
+		{"invalid source", "broken", "", "", true},
+		{"missing source", "", "", "", true},
+		{"invalid target", "4\n", "broken", "broken", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			source, target := filepath.Join(dir, "settle_index"), filepath.Join(dir, "zap_settle_index")
+			for path, data := range map[string]string{source: tc.previous, target: tc.current} {
+				if data != "" {
+					if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			err := ForkSettled(target, source)
+			if (err != nil) != tc.fail {
+				t.Fatalf("ForkSettled = %v", err)
+			}
+			data, readErr := os.ReadFile(target)
+			if string(data) != tc.want {
+				t.Fatalf("target = %q, want %q", data, tc.want)
+			}
+			if tc.want == "" && !os.IsNotExist(readErr) {
+				t.Fatalf("target created after failed migration: %v", readErr)
+			}
+		})
 	}
 }

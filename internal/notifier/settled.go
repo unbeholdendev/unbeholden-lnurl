@@ -97,3 +97,17 @@ func loadIndex(path string) (uint64, error) {
 func saveIndex(path string, index uint64) error {
 	return atomicfile.Write(path, []byte(strconv.FormatUint(index, 10)+"\n"))
 }
+
+// ForkSettled seeds a separate cursor from an existing one, preserving either
+// cursor's recovery position on subsequent starts.
+func ForkSettled(statePath, previousPath string) error {
+	_, err := loadIndex(statePath)
+	if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	from, err := loadIndex(previousPath)
+	if err != nil {
+		return err
+	}
+	return saveIndex(statePath, from)
+}
