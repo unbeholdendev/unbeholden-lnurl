@@ -21,7 +21,9 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
 
 ## Features
 
-- LNURL-pay / Lightning Address support (LUD-06, LUD-16, LUD-12 comments)
+- LNURL-pay / Lightning Address support (LUD-06, LUD-16), with comments (LUD-12), a
+  message after payment (LUD-09), a long description (LUD-20), an avatar, and payment
+  verification (LUD-21)
 - Notifications for every invoice settled on the node, via ntfy, including ones settled
   while the service was down
 - LNURL-withdraw vouchers (LUD-03) listed in the config
@@ -89,6 +91,7 @@ finish. Give the container at least that long to stop; the Compose file does.
 | --- | --- | --- |
 | `GET` | `/.well-known/lnurlp/{name}` | Returns the LNURL-pay `payRequest` document |
 | `GET` | *(callback from above)* | Returns a BOLT11 invoice for the requested amount |
+| `GET` | *(`verify` from above)* | Reports whether that invoice is paid, with its preimage once it is |
 
 ## Security notes
 
@@ -97,7 +100,7 @@ Give the server a macaroon with only the permissions its enabled features need, 
 
 | Feature | Permissions |
 | --- | --- |
-| `addresses` | `invoices:write` |
+| `addresses` | `invoices:read`, `invoices:write` |
 | `notifications` | `invoices:read` |
 | `withdraw` | `offchain:write`, `info:read` |
 
@@ -108,7 +111,7 @@ On Core Lightning, give a rune limited to the methods the enabled features call:
 
 | Feature | Methods |
 | --- | --- |
-| `addresses` | `invoice` |
+| `addresses` | `invoice`, `listinvoices` |
 | `notifications` | `listinvoices`, `waitanyinvoice` |
 | `withdraw` | `pay`, `listpays`, `getinfo` |
 

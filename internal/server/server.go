@@ -25,6 +25,7 @@ func New(trustedProxies []config.Prefix, withdraw *lnurl.WithdrawHandler, addres
 	if address != nil {
 		mux.HandleFunc("GET /.well-known/lnurlp/{username}", address.HandleWellKnown)
 		mux.HandleFunc("GET /.well-known/lnurlp/{username}/invoice", address.HandleInvoice)
+		mux.HandleFunc("GET /.well-known/lnurlp/{username}/verify/{token}", address.HandleVerify)
 	}
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))

@@ -160,7 +160,11 @@ func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.
 	}
 	var addressHandler *lnurl.AddressHandler
 	if len(cfg.Addresses) > 0 {
-		addressHandler = lnurl.NewAddressHandler(cfg.Addresses, node, notify)
+		verifyKey, err := cfg.VerifyKey()
+		if err != nil {
+			return nil, err
+		}
+		addressHandler = lnurl.NewAddressHandler(cfg.Addresses, node, notify, verifyKey)
 	}
 	return server.New(cfg.TrustedProxies, withdrawHandler, addressHandler), nil
 }

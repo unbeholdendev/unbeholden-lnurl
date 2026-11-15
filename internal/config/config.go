@@ -3,11 +3,14 @@ package config
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"net/netip"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -75,9 +78,16 @@ type WithdrawConfig struct {
 }
 
 type AddressEntry struct {
-	Description string `yaml:"description"`
-	MinSendable int64  `yaml:"min_sendable"`
-	MaxSendable int64  `yaml:"max_sendable"`
+	Description     string `yaml:"description"`
+	LongDescription string `yaml:"long_description,omitempty"`
+	ImageFile       string `yaml:"image_file,omitempty"`
+	SuccessMessage  string `yaml:"success_message,omitempty"`
+	MinSendable     int64  `yaml:"min_sendable"`
+	MaxSendable     int64  `yaml:"max_sendable"`
+
+	// ImageType and Image are the LUD-06 metadata entry read from ImageFile.
+	ImageType string `yaml:"-"`
+	Image     string `yaml:"-"`
 }
 
 // Voucher is an expanded single withdraw voucher (after batch expansion).
@@ -89,7 +99,11 @@ type Voucher struct {
 	Amount      int64 // millisatoshis
 }
 
-const minWithdrawSecretLen = 32
+const (
+	minWithdrawSecretLen = 32
+	maxImageLen          = 136536
+	maxSuccessMessageLen = 144
+)
 
 // tokenForVoucher generates a deterministic URL token from a voucher ID,
 // unguessable without the secret.
@@ -105,6 +119,25 @@ func (c *Config) WithdrawK1Key() []byte {
 	mac := hmac.New(sha256.New, []byte("unbeholden-lnurl withdraw k1"))
 	mac.Write([]byte(c.WithdrawSecret))
 	return mac.Sum(nil)
+}
+
+// VerifyKey returns the key for signing LUD-21 verify URLs. It is derived
+// from the node's macaroon or rune, so it needs no secret of its own;
+// replacing that credential breaks verify URLs already issued.
+func (c *Config) VerifyKey() ([]byte, error) {
+	var path string
+	if c.LND != nil {
+		path = c.LND.Macaroon
+	} else {
+		path = c.CLN.RuneFile
+	}
+	credential, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read node credential: %w", err)
+	}
+	mac := hmac.New(sha256.New, []byte("unbeholden-lnurl verify"))
+	mac.Write(credential)
+	return mac.Sum(nil), nil
 }
 
 func Load(path string) (*Config, error) {
@@ -126,7 +159,33 @@ func Load(path string) (*Config, error) {
 		}
 		n.Token = strings.TrimSpace(string(token))
 	}
+	for name, addr := range cfg.Addresses {
+		if addr.ImageFile == "" {
+			continue
+		}
+		if err := addr.loadImage(); err != nil {
+			return nil, fmt.Errorf("addresses.%s.image_file: %w", name, err)
+		}
+		cfg.Addresses[name] = addr
+	}
 	return &cfg, nil
+}
+
+func (a *AddressEntry) loadImage() error {
+	data, err := os.ReadFile(a.ImageFile)
+	if err != nil {
+		return err
+	}
+	contentType := http.DetectContentType(data)
+	if contentType != "image/png" && contentType != "image/jpeg" {
+		return fmt.Errorf("must be PNG or JPEG, not %s", contentType)
+	}
+	a.ImageType = contentType + ";base64"
+	a.Image = base64.StdEncoding.EncodeToString(data)
+	if len(a.Image) > maxImageLen {
+		return fmt.Errorf("must be at most 100 KB")
+	}
+	return nil
 }
 
 func (c *Config) Validate() error {
@@ -185,6 +244,9 @@ func (c *Config) Validate() error {
 		}
 		if addr.MinSendable > addr.MaxSendable {
 			return fmt.Errorf("addresses.%s.min_sendable must be <= max_sendable", name)
+		}
+		if utf8.RuneCountInString(addr.SuccessMessage) > maxSuccessMessageLen {
+			return fmt.Errorf("addresses.%s.success_message must be at most %d characters", name, maxSuccessMessageLen)
 		}
 	}
 	return nil

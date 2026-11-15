@@ -61,6 +61,14 @@ addresses:
   # Explicit entry takes priority over wildcard
   satoshi:
     description: "Satoshi's Lightning Address"
+    # Optional: shown on the pay screen instead of description. May span lines.
+    long_description: |
+      Tips for the blog.
+      Thank you!
+    # Optional: a PNG or JPEG of at most 100 KB, shown by the payer's wallet.
+    image_file: "/app/data/satoshi.png"
+    # Optional: shown by the payer's wallet after paying. At most 144 characters.
+    success_message: "Thanks for the tip!"
     min_sendable: 1000
     max_sendable: 1000000000
 

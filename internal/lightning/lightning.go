@@ -12,6 +12,18 @@ import (
 // reports the payment as failed, so no part of it can still settle.
 var ErrPaymentFailed = errors.New("payment failed")
 
+// Invoice is an invoice on the node.
+type Invoice struct {
+	PaymentRequest string
+	PaymentHash    []byte
+	Settled        bool
+	Preimage       []byte // nil until settled
+}
+
+// ErrInvoiceNotFound is returned by a backend's LookupInvoice for an unknown
+// payment hash.
+var ErrInvoiceNotFound = errors.New("invoice not found")
+
 // ChainParams returns the parameters of the chain a node names network.
 func ChainParams(network string) (*chaincfg.Params, error) {
 	switch network {

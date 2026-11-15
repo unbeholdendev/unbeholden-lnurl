@@ -2,22 +2,29 @@ package lnurl
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
 
 	"unbeholden-lnurl/internal/config"
+	"unbeholden-lnurl/internal/lightning"
 )
 
 const maxCommentLen = 140
 
-// Invoicer creates invoices.
+// Invoicer creates and looks up invoices.
 type Invoicer interface {
 	// AddInvoice creates an invoice for amountMsat that commits to the
 	// hash of description, with memo kept on the node.
-	AddInvoice(ctx context.Context, amountMsat int64, description, memo string) (string, error)
+	AddInvoice(ctx context.Context, amountMsat int64, description, memo string) (lightning.Invoice, error)
+	// LookupInvoice returns lightning.ErrInvoiceNotFound for an unknown hash.
+	LookupInvoice(ctx context.Context, paymentHash []byte) (lightning.Invoice, error)
 }
 
 // AddressHandler handles Lightning Address (LUD-16) requests.
@@ -25,6 +32,7 @@ type AddressHandler struct {
 	addresses map[string]config.AddressEntry
 	invoicer  Invoicer
 	ntfy      Notifier
+	verifyKey []byte
 }
 
 type payRequest struct {
@@ -37,15 +45,31 @@ type payRequest struct {
 }
 
 type invoiceResponse struct {
-	PR     string     `json:"pr"`
-	Routes []struct{} `json:"routes"`
+	PR            string         `json:"pr"`
+	Routes        []struct{}     `json:"routes"`
+	Disposable    bool           `json:"disposable"`
+	SuccessAction *successAction `json:"successAction,omitempty"`
+	Verify        string         `json:"verify"`
+}
+
+type successAction struct {
+	Tag     string `json:"tag"`
+	Message string `json:"message"`
+}
+
+type verifyResponse struct {
+	Status   string  `json:"status"`
+	Settled  bool    `json:"settled"`
+	Preimage *string `json:"preimage"`
+	PR       string  `json:"pr"`
 }
 
 // NewAddressHandler creates an AddressHandler. The "*" entry, if present,
 // serves every username without an entry of its own. A nil ntfy sends no
-// notifications.
-func NewAddressHandler(addresses map[string]config.AddressEntry, invoicer Invoicer, ntfy Notifier) *AddressHandler {
-	return &AddressHandler{addresses: addresses, invoicer: invoicer, ntfy: ntfy}
+// notifications. verifyKey signs verify URLs, so changing it breaks those
+// already issued.
+func NewAddressHandler(addresses map[string]config.AddressEntry, invoicer Invoicer, ntfy Notifier, verifyKey []byte) *AddressHandler {
+	return &AddressHandler{addresses: addresses, invoicer: invoicer, ntfy: ntfy, verifyKey: verifyKey}
 }
 
 func (h *AddressHandler) resolveAddress(username string) (config.AddressEntry, bool) {
@@ -68,7 +92,7 @@ func (h *AddressHandler) HandleWellKnown(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, payRequest{
 		Tag:            "payRequest",
 		Callback:       fmt.Sprintf("https://%s/.well-known/lnurlp/%s/invoice", r.Host, username),
-		Metadata:       addressMetadata(addr.Description, username, r.Host),
+		Metadata:       addressMetadata(addr, username, r.Host),
 		MinSendable:    addr.MinSendable,
 		MaxSendable:    addr.MaxSendable,
 		CommentAllowed: maxCommentLen,
@@ -105,7 +129,7 @@ func (h *AddressHandler) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bolt11, err := h.invoicer.AddInvoice(r.Context(), amountMsat, addressMetadata(addr.Description, username, r.Host), comment)
+	invoice, err := h.invoicer.AddInvoice(r.Context(), amountMsat, addressMetadata(addr, username, r.Host), comment)
 	if err != nil {
 		slog.Error("add invoice failed", "username", username, "err", err)
 		writeError(w, "failed to create invoice")
@@ -118,13 +142,68 @@ func (h *AddressHandler) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("invoice created", "sats", amountMsat/1000, "address", address)
 
-	writeJSON(w, invoiceResponse{PR: bolt11, Routes: []struct{}{}})
+	resp := invoiceResponse{
+		PR:     invoice.PaymentRequest,
+		Routes: []struct{}{},
+		Verify: fmt.Sprintf("https://%s/.well-known/lnurlp/%s/verify/%x", r.Host, username, h.verifyToken(username, invoice.PaymentHash)),
+	}
+	if addr.SuccessMessage != "" {
+		resp.SuccessAction = &successAction{Tag: "message", Message: addr.SuccessMessage}
+	}
+	writeJSON(w, resp)
 }
 
-func addressMetadata(description, username, host string) string {
-	data, _ := json.Marshal([][]string{
-		{"text/plain", description},
+// HandleVerify handles GET /.well-known/lnurlp/{username}/verify/{token}
+// (LUD-21). The token is signed, so it reveals no invoice the handler did not
+// issue for that username.
+func (h *AddressHandler) HandleVerify(w http.ResponseWriter, r *http.Request) {
+	username := r.PathValue("username")
+	if _, ok := h.resolveAddress(username); !ok {
+		http.NotFound(w, r)
+		return
+	}
+	token, err := hex.DecodeString(r.PathValue("token"))
+	if err != nil || len(token) < sha256.Size || !hmac.Equal(token, h.verifyToken(username, token[:sha256.Size])) {
+		writeError(w, "Not found")
+		return
+	}
+	invoice, err := h.invoicer.LookupInvoice(r.Context(), token[:sha256.Size])
+	if errors.Is(err, lightning.ErrInvoiceNotFound) {
+		writeError(w, "Not found")
+		return
+	}
+	if err != nil {
+		slog.Error("lookup invoice failed", "username", username, "err", err)
+		writeError(w, "failed to look up invoice")
+		return
+	}
+	resp := verifyResponse{Status: "OK", Settled: invoice.Settled, PR: invoice.PaymentRequest}
+	if invoice.Settled {
+		preimage := hex.EncodeToString(invoice.Preimage)
+		resp.Preimage = &preimage
+	}
+	writeJSON(w, resp)
+}
+
+// verifyToken is paymentHash followed by a MAC binding it to username.
+func (h *AddressHandler) verifyToken(username string, paymentHash []byte) []byte {
+	mac := hmac.New(sha256.New, h.verifyKey)
+	mac.Write(paymentHash)
+	mac.Write([]byte(username))
+	return mac.Sum(append([]byte{}, paymentHash...))[:sha256.Size+16]
+}
+
+func addressMetadata(addr config.AddressEntry, username, host string) string {
+	entries := [][]string{
+		{"text/plain", addr.Description},
 		{"text/identifier", fmt.Sprintf("%s@%s", username, host)},
-	})
+	}
+	if addr.LongDescription != "" {
+		entries = append(entries, []string{"text/long-desc", addr.LongDescription})
+	}
+	if addr.Image != "" {
+		entries = append(entries, []string{addr.ImageType, addr.Image})
+	}
+	data, _ := json.Marshal(entries)
 	return string(data)
 }

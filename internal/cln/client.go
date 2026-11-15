@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -120,9 +121,10 @@ func (c *Client) call(ctx context.Context, method string, params, result any) er
 
 // AddInvoice creates an invoice for amountMsat committing to the hash of
 // description. Core Lightning keeps no memo, so memo goes in the label.
-func (c *Client) AddInvoice(ctx context.Context, amountMsat int64, description, memo string) (string, error) {
+func (c *Client) AddInvoice(ctx context.Context, amountMsat int64, description, memo string) (lightning.Invoice, error) {
 	var resp struct {
-		Bolt11 string `json:"bolt11"`
+		Bolt11      string `json:"bolt11"`
+		PaymentHash string `json:"payment_hash"`
 	}
 	err := c.call(ctx, "invoice", map[string]any{
 		"amount_msat":  amountMsat,
@@ -130,7 +132,42 @@ func (c *Client) AddInvoice(ctx context.Context, amountMsat int64, description, 
 		"description":  description,
 		"deschashonly": true,
 	}, &resp)
-	return resp.Bolt11, err
+	if err != nil {
+		return lightning.Invoice{}, err
+	}
+	hash, err := hex.DecodeString(resp.PaymentHash)
+	if err != nil {
+		return lightning.Invoice{}, fmt.Errorf("invoice: payment hash: %w", err)
+	}
+	return lightning.Invoice{PaymentRequest: resp.Bolt11, PaymentHash: hash}, nil
+}
+
+// LookupInvoice returns the invoice with paymentHash, or
+// lightning.ErrInvoiceNotFound.
+func (c *Client) LookupInvoice(ctx context.Context, paymentHash []byte) (lightning.Invoice, error) {
+	var resp struct {
+		Invoices []struct {
+			Bolt11          string `json:"bolt11"`
+			Status          string `json:"status"`
+			PaymentPreimage string `json:"payment_preimage"`
+		} `json:"invoices"`
+	}
+	if err := c.call(ctx, "listinvoices", map[string]any{"payment_hash": hex.EncodeToString(paymentHash)}, &resp); err != nil {
+		return lightning.Invoice{}, err
+	}
+	if len(resp.Invoices) == 0 {
+		return lightning.Invoice{}, lightning.ErrInvoiceNotFound
+	}
+	found := resp.Invoices[0]
+	invoice := lightning.Invoice{PaymentRequest: found.Bolt11, PaymentHash: paymentHash, Settled: found.Status == "paid"}
+	if invoice.Settled {
+		preimage, err := hex.DecodeString(found.PaymentPreimage)
+		if err != nil {
+			return lightning.Invoice{}, fmt.Errorf("listinvoices: payment preimage: %w", err)
+		}
+		invoice.Preimage = preimage
+	}
+	return invoice, nil
 }
 
 // SendPayment pays a BOLT-11 invoice. An error wrapping

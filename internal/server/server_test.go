@@ -91,7 +91,7 @@ func TestClientIP(t *testing.T) {
 func TestNew_ForwardedHostOnlyFromTrustedProxy(t *testing.T) {
 	address := lnurl.NewAddressHandler(map[string]config.AddressEntry{
 		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
-	}, nil, nil)
+	}, nil, nil, []byte("verify key"))
 	srv := New(trustedProxies(t, "10.0.0.0/8"), nil, address)
 
 	for remote, want := range map[string]string{

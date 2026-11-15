@@ -2,10 +2,12 @@ package config
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -220,5 +222,91 @@ cln:
 				t.Fatal("expected error")
 			}
 		})
+	}
+}
+
+func TestLoad_AddressImage(t *testing.T) {
+	dir := t.TempDir()
+	png := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 16)...)
+	write := func(name string, data []byte) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	load := func(path string) (*Config, error) {
+		return Load(writeTestConfig(t, lndYAML+`
+listen: "127.0.0.1:8080"
+addresses:
+  bob:
+    min_sendable: 1000
+    max_sendable: 2000
+    image_file: "`+path+`"
+`))
+	}
+
+	cfg, err := load(write("avatar.png", png))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bob := cfg.Addresses["bob"]; bob.ImageType != "image/png;base64" || bob.Image != base64.StdEncoding.EncodeToString(png) {
+		t.Fatalf("bob = %+v", bob)
+	}
+	for name, data := range map[string][]byte{
+		"text.png":  []byte("not an image"),
+		"large.png": append(png, make([]byte, 110_000)...),
+	} {
+		if _, err := load(write(name, data)); err == nil {
+			t.Errorf("%s: loaded", name)
+		}
+	}
+	if _, err := load(filepath.Join(dir, "missing.png")); err == nil {
+		t.Error("missing file: loaded")
+	}
+}
+
+func TestLoad_SuccessMessageLength(t *testing.T) {
+	load := func(message string) error {
+		_, err := Load(writeTestConfig(t, lndYAML+`
+listen: "127.0.0.1:8080"
+addresses:
+  bob:
+    min_sendable: 1000
+    max_sendable: 2000
+    success_message: "`+message+`"
+`))
+		return err
+	}
+	if err := load(strings.Repeat("é", 144)); err != nil {
+		t.Fatalf("144 characters: %v", err)
+	}
+	if err := load(strings.Repeat("x", 145)); err == nil {
+		t.Fatal("145 characters: loaded")
+	}
+}
+
+func TestVerifyKey_FromNodeCredential(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	lnd := &Config{LND: &LNDConfig{Macaroon: write("macaroon", "m")}}
+	cln := &Config{CLN: &CLNConfig{RuneFile: write("rune", "r")}}
+
+	lndKey, err := lnd.VerifyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clnKey, err := cln.VerifyKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(lndKey) == string(clnKey) {
+		t.Fatal("keys from different credentials match")
 	}
 }

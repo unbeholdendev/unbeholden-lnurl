@@ -144,10 +144,10 @@ func TestSendPayment_Outcomes(t *testing.T) {
 }
 
 func TestInvoices_MemoRoundTripsThroughLabel(t *testing.T) {
-	f, c := newFakeNode(t, map[string][]reply{"invoice": {ok(map[string]string{"bolt11": "lnbc1"})}})
-	bolt11, err := c.AddInvoice(context.Background(), 5000, `[["text/plain","a<b"]]`, "thanks for the tip")
-	if err != nil || bolt11 != "lnbc1" {
-		t.Fatalf("AddInvoice() = %q, %v", bolt11, err)
+	f, c := newFakeNode(t, map[string][]reply{"invoice": {ok(map[string]string{"bolt11": "lnbc1", "payment_hash": "abcd"})}})
+	inv, err := c.AddInvoice(context.Background(), 5000, `[["text/plain","a<b"]]`, "thanks for the tip")
+	if err != nil || inv.PaymentRequest != "lnbc1" || string(inv.PaymentHash) != "\xab\xcd" {
+		t.Fatalf("AddInvoice() = %+v, %v", inv, err)
 	}
 	call := f.calls[0]
 	if call["description"] != `[["text/plain","a<b"]]` || call["deschashonly"] != true || call["amount_msat"] != float64(5000) {
@@ -203,5 +203,29 @@ func TestLastPaidIndex(t *testing.T) {
 	}})}})
 	if got, err := c.LastPaidIndex(context.Background()); err != nil || got != 7 {
 		t.Fatalf("LastPaidIndex() = %d, %v; want 7", got, err)
+	}
+}
+
+func TestLookupInvoice(t *testing.T) {
+	f, c := newFakeNode(t, map[string][]reply{"listinvoices": {
+		ok(map[string]any{"invoices": []map[string]string{{"bolt11": "lnbc1", "status": "unpaid"}}}),
+		ok(map[string]any{"invoices": []map[string]string{{"bolt11": "lnbc1", "status": "paid", "payment_preimage": "beef"}}}),
+		ok(map[string]any{"invoices": []any{}}),
+	}})
+	ctx := context.Background()
+
+	unpaid, err := c.LookupInvoice(ctx, []byte{0xab})
+	if err != nil || unpaid.Settled || unpaid.Preimage != nil || unpaid.PaymentRequest != "lnbc1" {
+		t.Fatalf("unpaid = %+v, %v", unpaid, err)
+	}
+	if f.calls[0]["payment_hash"] != "ab" {
+		t.Fatalf("listinvoices params = %v", f.calls[0])
+	}
+	paid, err := c.LookupInvoice(ctx, []byte{0xab})
+	if err != nil || !paid.Settled || string(paid.Preimage) != "\xbe\xef" {
+		t.Fatalf("paid = %+v, %v", paid, err)
+	}
+	if _, err := c.LookupInvoice(ctx, []byte{0xab}); !errors.Is(err, lightning.ErrInvoiceNotFound) {
+		t.Fatalf("missing: err = %v, want ErrInvoiceNotFound", err)
 	}
 }

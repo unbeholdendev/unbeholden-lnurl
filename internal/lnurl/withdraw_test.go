@@ -32,6 +32,8 @@ type fakeNode struct {
 	pay      func(ctx context.Context) error
 	payments int
 	notified []string
+	invoices map[string]lightning.Invoice
+	last     string
 }
 
 func (f *fakeNode) SendPayment(ctx context.Context, _ string, _ int64) error {
@@ -44,8 +46,43 @@ func (f *fakeNode) SendPayment(ctx context.Context, _ string, _ int64) error {
 	return nil
 }
 
-func (f *fakeNode) AddInvoice(_ context.Context, amountMsat int64, _, memo string) (string, error) {
-	return fmt.Sprintf("lnbc-%d-%s", amountMsat, memo), nil
+func (f *fakeNode) AddInvoice(_ context.Context, amountMsat int64, _, memo string) (lightning.Invoice, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.invoices == nil {
+		f.invoices = map[string]lightning.Invoice{}
+	}
+	hash := make([]byte, 32)
+	hash[0] = byte(len(f.invoices) + 1)
+	invoice := lightning.Invoice{PaymentRequest: fmt.Sprintf("lnbc-%d-%s", amountMsat, memo), PaymentHash: hash}
+	f.last = hex.EncodeToString(hash)
+	f.invoices[f.last] = invoice
+	return invoice, nil
+}
+
+func (f *fakeNode) LookupInvoice(_ context.Context, paymentHash []byte) (lightning.Invoice, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	invoice, ok := f.invoices[hex.EncodeToString(paymentHash)]
+	if !ok {
+		return lightning.Invoice{}, lightning.ErrInvoiceNotFound
+	}
+	return invoice, nil
+}
+
+func (f *fakeNode) lastHash() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.last
+}
+
+func (f *fakeNode) settle(hash string, preimage []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	invoice := f.invoices[hash]
+	invoice.Settled = true
+	invoice.Preimage = preimage
+	f.invoices[hash] = invoice
 }
 
 func (f *fakeNode) NotifyVoucherClaimed(voucherID string, amountSats int64) {

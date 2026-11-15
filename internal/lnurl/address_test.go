@@ -1,7 +1,9 @@
 package lnurl
 
 import (
+	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -9,8 +11,10 @@ import (
 	"unbeholden-lnurl/internal/config"
 )
 
+var testVerifyKey = []byte("verify key")
+
 func TestAddressMetadata_SimpleValues(t *testing.T) {
-	meta := addressMetadata("Lightning Address", "satoshi", "pay.example.com")
+	meta := addressMetadata(config.AddressEntry{Description: "Lightning Address"}, "satoshi", "pay.example.com")
 
 	var parsed [][]string
 	if err := json.Unmarshal([]byte(meta), &parsed); err != nil {
@@ -29,7 +33,7 @@ func TestAddressMetadata_SimpleValues(t *testing.T) {
 }
 
 func TestAddressMetadata_SpecialCharsInUsername(t *testing.T) {
-	meta := addressMetadata("desc", `user"inject`, "example.com")
+	meta := addressMetadata(config.AddressEntry{Description: "desc"}, `user"inject`, "example.com")
 
 	var parsed [][]string
 	if err := json.Unmarshal([]byte(meta), &parsed); err != nil {
@@ -42,7 +46,7 @@ func TestAddressMetadata_SpecialCharsInUsername(t *testing.T) {
 }
 
 func TestAddressMetadata_SpecialCharsInDescription(t *testing.T) {
-	meta := addressMetadata(`He said "hello"`, "user", "example.com")
+	meta := addressMetadata(config.AddressEntry{Description: `He said "hello"`}, "user", "example.com")
 
 	var parsed [][]string
 	if err := json.Unmarshal([]byte(meta), &parsed); err != nil {
@@ -55,7 +59,7 @@ func TestAddressMetadata_SpecialCharsInDescription(t *testing.T) {
 }
 
 func TestAddressMetadata_BackslashInUsername(t *testing.T) {
-	meta := addressMetadata("desc", `user\name`, "example.com")
+	meta := addressMetadata(config.AddressEntry{Description: "desc"}, `user\name`, "example.com")
 
 	var parsed [][]string
 	if err := json.Unmarshal([]byte(meta), &parsed); err != nil {
@@ -67,10 +71,28 @@ func TestAddressMetadata_BackslashInUsername(t *testing.T) {
 	}
 }
 
+func TestAddressMetadata_LongDescriptionAndImage(t *testing.T) {
+	meta := addressMetadata(config.AddressEntry{
+		Description:     "short",
+		LongDescription: "long\ntext",
+		ImageType:       "image/png;base64",
+		Image:           "iVBO",
+	}, "user", "example.com")
+
+	var parsed [][]string
+	if err := json.Unmarshal([]byte(meta), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed) != 4 || parsed[2][0] != "text/long-desc" || parsed[2][1] != "long\ntext" ||
+		parsed[3][0] != "image/png;base64" || parsed[3][1] != "iVBO" {
+		t.Fatalf("metadata = %v", parsed)
+	}
+}
+
 func TestHandleWellKnown_DomainFromHost(t *testing.T) {
 	h := NewAddressHandler(map[string]config.AddressEntry{
 		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
-	}, nil, nil)
+	}, nil, nil, testVerifyKey)
 
 	req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob", nil)
 	req.SetPathValue("username", "bob")
@@ -93,7 +115,7 @@ func TestHandleInvoice(t *testing.T) {
 	node := &fakeNode{}
 	h := NewAddressHandler(map[string]config.AddressEntry{
 		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
-	}, node, node)
+	}, node, node, testVerifyKey)
 
 	get := func(query string) map[string]any {
 		req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob/invoice?"+query, nil)
@@ -108,8 +130,14 @@ func TestHandleInvoice(t *testing.T) {
 	}
 
 	resp := get("amount=1500&comment=hi")
-	if resp["pr"] != "lnbc-1500-hi" || resp["routes"] == nil {
+	if resp["pr"] != "lnbc-1500-hi" || resp["routes"] == nil || resp["disposable"] != false {
 		t.Fatalf("response = %v", resp)
+	}
+	if _, ok := resp["successAction"]; ok {
+		t.Fatalf("successAction without success_message: %v", resp)
+	}
+	if want := "https://shop.example.com/.well-known/lnurlp/bob/verify/" + node.lastHash(); !strings.HasPrefix(resp["verify"].(string), want) {
+		t.Fatalf("verify = %v, want %s", resp["verify"], want)
 	}
 	if len(node.notified) != 1 || node.notified[0] != "invoice 1 bob@shop.example.com hi" {
 		t.Fatalf("notified = %v", node.notified)
@@ -125,12 +153,104 @@ func TestHandleInvoice(t *testing.T) {
 func TestHandleInvoice_WithoutNotifier(t *testing.T) {
 	h := NewAddressHandler(map[string]config.AddressEntry{
 		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
-	}, &fakeNode{}, nil)
+	}, &fakeNode{}, nil, testVerifyKey)
 	req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob/invoice?amount=1500", nil)
 	req.SetPathValue("username", "bob")
 	rec := httptest.NewRecorder()
 	h.HandleInvoice(rec, req)
 	if !strings.Contains(rec.Body.String(), "lnbc-1500") {
 		t.Fatalf("response = %s", rec.Body.String())
+	}
+}
+
+func TestHandleInvoice_SuccessMessage(t *testing.T) {
+	h := NewAddressHandler(map[string]config.AddressEntry{
+		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000, SuccessMessage: "Thanks!"},
+	}, &fakeNode{}, nil, testVerifyKey)
+	req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob/invoice?amount=1500", nil)
+	req.SetPathValue("username", "bob")
+	rec := httptest.NewRecorder()
+	h.HandleInvoice(rec, req)
+	if want := `"successAction":{"tag":"message","message":"Thanks!"}`; !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("response = %s, want %s", rec.Body.String(), want)
+	}
+}
+
+func TestHandleVerify(t *testing.T) {
+	node := &fakeNode{}
+	h := NewAddressHandler(map[string]config.AddressEntry{
+		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
+	}, node, nil, testVerifyKey)
+
+	call := func(handler http.HandlerFunc, path, username, token string) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest("GET", "https://shop.example.com"+path, nil)
+		req.SetPathValue("username", username)
+		req.SetPathValue("token", token)
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("%s: %v: %s", path, err, rec.Body.String())
+		}
+		return resp
+	}
+	verify := func(username, token string) map[string]any {
+		return call(h.HandleVerify, "/verify", username, token)
+	}
+
+	issued := call(h.HandleInvoice, "/invoice?amount=1500", "bob", "")
+	hash := node.lastHash()
+	token := issued["verify"].(string)[strings.LastIndex(issued["verify"].(string), "/")+1:]
+
+	resp := verify("bob", token)
+	if resp["status"] != "OK" || resp["settled"] != false || resp["preimage"] != nil || resp["pr"] != "lnbc-1500-" {
+		t.Fatalf("unpaid: %v", resp)
+	}
+	if _, ok := resp["preimage"]; !ok {
+		t.Fatalf("unpaid: preimage missing, want null: %v", resp)
+	}
+
+	node.settle(hash, []byte{0xab, 0xcd})
+	if resp := verify("bob", token); resp["settled"] != true || resp["preimage"] != "abcd" {
+		t.Fatalf("settled: %v", resp)
+	}
+
+	for name, args := range map[string][2]string{
+		"other address": {"alice", token},
+		"unsigned hash": {"bob", hash},
+		"forged token":  {"bob", hash + strings.Repeat("00", 16)},
+		"unknown hash":  {"bob", hex.EncodeToString(h.verifyToken("bob", make([]byte, 32)))},
+		"not hex":       {"bob", "xyz"},
+	} {
+		if resp := verify(args[0], args[1]); resp["status"] != "ERROR" {
+			t.Errorf("%s: %v", name, resp)
+		}
+	}
+}
+
+func TestHandleVerify_AfterMetadataChange(t *testing.T) {
+	node := &fakeNode{}
+	entry := config.AddressEntry{Description: "before", MinSendable: 1000, MaxSendable: 2000}
+	before := NewAddressHandler(map[string]config.AddressEntry{"*": entry}, node, nil, testVerifyKey)
+	req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob/invoice?amount=1500", nil)
+	req.SetPathValue("username", "bob")
+	rec := httptest.NewRecorder()
+	before.HandleInvoice(rec, req)
+	var issued map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &issued); err != nil {
+		t.Fatal(err)
+	}
+	node.settle(node.lastHash(), []byte{1})
+
+	entry.Description = "after"
+	after := NewAddressHandler(map[string]config.AddressEntry{"*": entry}, node, nil, testVerifyKey)
+	req = httptest.NewRequest("GET", issued["verify"].(string), nil)
+	req.SetPathValue("username", "bob")
+	req.SetPathValue("token", strings.TrimPrefix(issued["verify"].(string), "https://shop.example.com/.well-known/lnurlp/bob/verify/"))
+	rec = httptest.NewRecorder()
+	after.HandleVerify(rec, req)
+	if !strings.Contains(rec.Body.String(), `"settled":true`) {
+		t.Fatalf("verify after metadata change = %s", rec.Body.String())
 	}
 }

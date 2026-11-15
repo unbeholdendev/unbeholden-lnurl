@@ -10,6 +10,8 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"unbeholden-lnurl/internal/lightning"
 )
@@ -20,6 +22,15 @@ type fakeLightning struct {
 	streamed  []*lnrpc.Invoice
 	streamCtx context.Context
 	network   string
+	lookup    map[string]*lnrpc.Invoice
+}
+
+func (f *fakeLightning) LookupInvoice(_ context.Context, req *lnrpc.PaymentHash, _ ...grpc.CallOption) (*lnrpc.Invoice, error) {
+	invoice, ok := f.lookup[string(req.RHash)]
+	if !ok {
+		return nil, status.Error(codes.NotFound, "unable to locate invoice")
+	}
+	return invoice, nil
 }
 
 func (f *fakeLightning) ListInvoices(_ context.Context, req *lnrpc.ListInvoiceRequest, _ ...grpc.CallOption) (*lnrpc.ListInvoiceResponse, error) {
@@ -161,5 +172,25 @@ func TestNetwork(t *testing.T) {
 	}
 	if _, err := (&Client{lightning: &fakeLightning{network: "litecoin"}}).Network(context.Background()); err == nil {
 		t.Error("expected error for unknown network")
+	}
+}
+
+func TestLookupInvoice(t *testing.T) {
+	c := &Client{lightning: &fakeLightning{lookup: map[string]*lnrpc.Invoice{
+		"open":    {PaymentRequest: "lnbc1", RPreimage: []byte("secret"), State: lnrpc.Invoice_OPEN},
+		"settled": {PaymentRequest: "lnbc2", RPreimage: []byte("secret"), State: lnrpc.Invoice_SETTLED},
+	}}}
+	ctx := context.Background()
+
+	open, err := c.LookupInvoice(ctx, []byte("open"))
+	if err != nil || open.Settled || open.Preimage != nil || open.PaymentRequest != "lnbc1" {
+		t.Fatalf("open = %+v, %v", open, err)
+	}
+	settled, err := c.LookupInvoice(ctx, []byte("settled"))
+	if err != nil || !settled.Settled || string(settled.Preimage) != "secret" {
+		t.Fatalf("settled = %+v, %v", settled, err)
+	}
+	if _, err := c.LookupInvoice(ctx, []byte("missing")); !errors.Is(err, lightning.ErrInvoiceNotFound) {
+		t.Fatalf("missing: err = %v, want ErrInvoiceNotFound", err)
 	}
 }

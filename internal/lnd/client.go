@@ -14,7 +14,9 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 	"gopkg.in/macaroon.v2"
 
 	"unbeholden-lnurl/internal/lightning"
@@ -71,7 +73,7 @@ func (c *Client) Close() error {
 
 // AddInvoice creates an invoice for amountMsat committing to the hash of
 // description, with memo stored on the node.
-func (c *Client) AddInvoice(ctx context.Context, amountMsat int64, description, memo string) (string, error) {
+func (c *Client) AddInvoice(ctx context.Context, amountMsat int64, description, memo string) (lightning.Invoice, error) {
 	descriptionHash := sha256.Sum256([]byte(description))
 	resp, err := c.lightning.AddInvoice(ctx, &lnrpc.Invoice{
 		ValueMsat:       amountMsat,
@@ -79,9 +81,30 @@ func (c *Client) AddInvoice(ctx context.Context, amountMsat int64, description, 
 		Memo:            memo,
 	})
 	if err != nil {
-		return "", fmt.Errorf("add invoice: %w", err)
+		return lightning.Invoice{}, fmt.Errorf("add invoice: %w", err)
 	}
-	return resp.PaymentRequest, nil
+	return lightning.Invoice{PaymentRequest: resp.PaymentRequest, PaymentHash: resp.RHash}, nil
+}
+
+// LookupInvoice returns the invoice with paymentHash, or
+// lightning.ErrInvoiceNotFound.
+func (c *Client) LookupInvoice(ctx context.Context, paymentHash []byte) (lightning.Invoice, error) {
+	resp, err := c.lightning.LookupInvoice(ctx, &lnrpc.PaymentHash{RHash: paymentHash})
+	if status.Code(err) == codes.NotFound {
+		return lightning.Invoice{}, lightning.ErrInvoiceNotFound
+	}
+	if err != nil {
+		return lightning.Invoice{}, fmt.Errorf("lookup invoice: %w", err)
+	}
+	invoice := lightning.Invoice{
+		PaymentRequest: resp.PaymentRequest,
+		PaymentHash:    resp.RHash,
+		Settled:        resp.State == lnrpc.Invoice_SETTLED,
+	}
+	if invoice.Settled {
+		invoice.Preimage = resp.RPreimage
+	}
+	return invoice, nil
 }
 
 // SendPayment pays a BOLT-11 invoice. An error wrapping
