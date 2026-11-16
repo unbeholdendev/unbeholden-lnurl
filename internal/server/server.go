@@ -36,7 +36,10 @@ func New(trustedProxies []config.Prefix, rateLimit config.RateLimit, withdraw *l
 	handler = newRateLimiter(float64(rateLimit.PerMinute)/60, rateLimit.Burst).middleware(p.clientIP, handler)
 	handler = p.forwardedHost(handler)
 	return &http.Server{
-		Handler:           handler,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			handler.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      lnurl.PayTimeout + 10*time.Second,

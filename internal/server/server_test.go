@@ -112,3 +112,34 @@ func TestNew_ForwardedHostOnlyFromTrustedProxy(t *testing.T) {
 		}
 	}
 }
+
+func TestNew_CrossOriginLNURL(t *testing.T) {
+	address := lnurl.NewAddressHandler(map[string]config.AddressEntry{
+		"bob": {Description: "tips", MinSendable: 1000, MaxSendable: 2000},
+	}, nil, nil, []byte("verify key"), nil)
+	for _, path := range []string{
+		"/.well-known/lnurlp/bob",
+		"/.well-known/lnurlp/bob/invoice",
+		"/.well-known/lnurlp/bob/verify/invalid",
+		"/.well-known/lnurlp/unknown",
+	} {
+		t.Run(path, func(t *testing.T) {
+			srv := New(nil, config.RateLimit{PerMinute: 1, Burst: 1}, nil, address)
+			for i := range 2 {
+				req := httptest.NewRequest(http.MethodGet, "https://pay.example.com"+path, nil)
+				req.Header.Set("Origin", "https://jumble.social")
+				rec := httptest.NewRecorder()
+				srv.Handler.ServeHTTP(rec, req)
+				if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+					t.Errorf("request %d: Access-Control-Allow-Origin = %q, want * (status %d)", i, got, rec.Code)
+				}
+				if rec.Header().Get("Access-Control-Allow-Credentials") != "" {
+					t.Error("unexpected credentialed CORS")
+				}
+				if i == 1 && rec.Code != http.StatusTooManyRequests {
+					t.Errorf("second request status = %d, want 429", rec.Code)
+				}
+			}
+		})
+	}
+}
