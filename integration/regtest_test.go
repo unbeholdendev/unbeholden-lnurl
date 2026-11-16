@@ -85,6 +85,7 @@ func TestRegtest(t *testing.T) {
 		for _, backend := range []string{"lnd", "cln"} {
 			t.Run(backend, func(t *testing.T) {
 				node := n.backendYAML(t, backend)
+				t.Run("DiagnosticsAreReadOnly", func(t *testing.T) { testDiagnostics(t, n, binary, node, backend) })
 				t.Run("NotificationsRecoverAfterDowntimeAndDeliveryFailure", func(t *testing.T) { testNotifications(t, n, binary, node) })
 				t.Run("AddressOptionsAndVerificationSurviveRestart", func(t *testing.T) { testAddress(t, n, binary, node) })
 				t.Run("ConfiguredRateLimitAndProxyTrust", func(t *testing.T) { testRateLimit(t, binary, node) })

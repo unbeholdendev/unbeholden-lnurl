@@ -46,6 +46,8 @@ func buildVersion() string {
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
+	diagnostics := flag.Bool("diagnose", false, "check files, state permissions and read-only node access, then exit")
+	publicURL := flag.String("public-url", "", "public LNURL-pay metadata URL to check with -diagnose")
 	healthcheck := flag.Bool("healthcheck", false, "run health check and exit")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	listVouchers := flag.Bool("list-vouchers", false, "print unclaimed vouchers as JSON and exit")
@@ -56,10 +58,23 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 
+	if (*publicURL != "" && !*diagnostics) || (*diagnostics && (*healthcheck || *listVouchers)) {
+		slog.Error("use -public-url with -diagnose; do not combine -diagnose with -healthcheck or -list-vouchers")
+		os.Exit(1)
+	}
+
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		slog.Error("load config", "err", err)
 		os.Exit(1)
+	}
+	if *diagnostics {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := diagnose(ctx, cfg, *publicURL, os.Stdout); err != nil {
+			os.Exit(1)
+		}
+		return
 	}
 	if *listVouchers {
 		handler, err := lnurl.NewWithdrawHandler(cfg.ExpandVouchers(), cfg.WithdrawK1Key(), nil, nil, nil, filepath.Join(cfg.StateDir, "state.json"))

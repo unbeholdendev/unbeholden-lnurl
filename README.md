@@ -86,6 +86,40 @@ retry without blocking later zap receipts. Keep `settle_index` and `zap_settle_i
 in `state_dir` across restarts. On upgrade, the zap cursor starts from the existing
 `settle_index` before the HTTP listener starts.
 
+### Diagnostics
+
+Check the deployment without starting a listener or creating invoices:
+
+```sh
+unbeholden-lnurl -config config.yaml -diagnose
+```
+
+With Compose, run the checks under the container's user with its mounted files:
+
+```sh
+docker compose run --rm --no-deps unbeholden-lnurl -config /app/config.yaml -diagnose
+```
+
+The command loads the config and its feature files, checks verification and zap
+keys, probes state-directory writes and renames, and makes read-only node calls.
+It prints `OK`, `FAIL`, `NOTE` and `SKIP` lines and exits nonzero if a check fails.
+A missing state directory is created; temporary probe files are removed. Existing
+settlement cursors and voucher claims are left alone.
+
+While the service is running, add a public metadata URL to check HTTPS, LNURL-pay
+metadata, the callback host, browser CORS access and the configured zap public key:
+
+```sh
+unbeholden-lnurl -config config.yaml -diagnose \
+  -public-url https://yourdomain.com/.well-known/lnurlp/you
+```
+
+The public check fetches metadata only. It does not follow redirects or request an
+invoice. HTTP is accepted for onion addresses, and `outbound_proxy` also applies
+to this check. Node and public requests each have a 10-second limit, within a
+30-second limit for the command. Invoice creation, payment and subscription
+permissions are not exercised, and no notifications or zap receipts are sent.
+
 ### Payment verification
 
 Set `verify_key_file` to keep LUD-21 verify URLs valid when the node's macaroon or rune
