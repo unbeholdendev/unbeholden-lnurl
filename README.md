@@ -49,10 +49,9 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
 From a checkout of the repository:
 
 ```bash
-mkdir -p docker-data
-cp config.example.yaml docker-data/config.yaml
-# edit docker-data/config.yaml: your address names and node connection details
-# copy tls.cert and invoice.macaroon into docker-data/
+cp config.example.yaml config.yaml
+# edit config.yaml: your address names and node connection details
+# copy tls.cert and invoice.macaroon beside docker-compose.yaml
 
 docker compose up -d
 ```

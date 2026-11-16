@@ -3,6 +3,12 @@
 
 # Config (may contain secrets)
 config.yaml
+config.yml
+
+# Node credentials and signing keys
+/tls.cert
+/*.macaroon
+/*.key
 
 # State
 data/

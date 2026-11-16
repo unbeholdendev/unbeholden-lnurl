@@ -4,10 +4,11 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./docker-data/config.yaml:/app/config.yaml:ro
+      - ./config.yaml:/app/config.yaml:ro
       - data:/app/data
-      - ./docker-data/tls.cert:/certs/tls.cert:ro
-      - ./docker-data/invoice.macaroon:/macaroons/invoice.macaroon:ro
+      - ./tls.cert:/certs/tls.cert:ro
+      - ./invoice.macaroon:/macaroons/invoice.macaroon:ro
+      # - ./nostr.key:/run/secrets/nostr.key:ro
     healthcheck:
       test: ["CMD", "/app/unbeholden-lnurl", "-healthcheck"]
       interval: 30s
