@@ -21,16 +21,3 @@ jobs:
       - run: go run honnef.co/go/tools/cmd/staticcheck@2026.2.2 ./...
         env:
           GOTOOLCHAIN: auto # staticcheck needs a newer Go than go.mod
-
-  regtest:
-    runs-on: docker
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-      - uses: https://github.com/cachix/install-nix-action@v31
-        with:
-          enable_kvm: false
-      - name: Regtest payments and recovery on LND and CLN
-        run: >-
-          nix-shell integration/shell.nix --run
-          'LNURL_REGTEST=1 go test -race -count=1 -timeout=10m -v ./integration'

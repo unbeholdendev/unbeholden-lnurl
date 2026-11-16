@@ -52,9 +52,19 @@ From a checkout of the repository:
 mkdir -p docker-data
 cp config.example.yaml docker-data/config.yaml
 # edit docker-data/config.yaml: your address names and node connection details
+# copy tls.cert and invoice.macaroon into docker-data/
 
 docker compose up -d
 ```
+
+The container runs as a non-root user. Compose stores writable state in a named
+volume, initialised with the image's data-directory ownership. Create the config,
+certificate and macaroon files before starting Compose, and make them readable
+by the container's UID 65532. Mount any other files your config uses,
+such as a withdraw secret, separately.
+
+Keep the named volume across upgrades. `docker compose down` keeps it;
+`docker compose down -v` deletes it, including voucher claims and settlement cursors.
 
 Then verify it resolves:
 

@@ -20,7 +20,9 @@ The pinned versions are Bitcoin Core 32.1, Core Lightning 26.06.10 and LND
 another installation, set `LNURL_CLNREST_PLUGIN` to the plugin executable if
 CLNRest is not already bundled with `lightningd`.
 
-Forgejo CI runs the suite on pull requests and pushes to main.
+Forgejo CI runs the suite on pull requests and pushes to main that change Go
+source, `go.mod`, `go.sum`, integration files other than Markdown, or the regtest
+workflow. Documentation and packaging changes keep the fast checks only.
 
 The suite starts a private regtest chain, a CLN payer and one receiver of each
 backend. It mines funds and opens channels itself. Nodes and service processes

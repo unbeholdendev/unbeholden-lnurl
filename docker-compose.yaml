@@ -5,7 +5,7 @@ services:
       - "8080:8080"
     volumes:
       - ./docker-data/config.yaml:/app/config.yaml:ro
-      - ./docker-data/data:/app/data
+      - data:/app/data
       - ./docker-data/tls.cert:/certs/tls.cert:ro
       - ./docker-data/invoice.macaroon:/macaroons/invoice.macaroon:ro
     healthcheck:
@@ -16,3 +16,6 @@ services:
       retries: 3
     stop_grace_period: 2m30s
     restart: unless-stopped
+
+volumes:
+  data:
