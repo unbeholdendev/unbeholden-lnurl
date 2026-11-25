@@ -25,7 +25,7 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
   message after payment (LUD-09), a long description (LUD-20), an avatar, and payment
   verification (LUD-21)
 - Nostr zaps (NIP-57): zap receipts are published to the payer's relays once paid
-- Notifications for every invoice settled on the node, via ntfy, including ones settled
+- Notifications for every invoice settled on the node, via ntfy or signed webhooks, including ones settled
   while the service was down
 - LNURL-withdraw vouchers (LUD-03) listed in the config
 - LND backend over gRPC with macaroon authentication
@@ -85,6 +85,37 @@ Payment notifications and zap receipts track settlements independently, so ntfy 
 retry without blocking later zap receipts. Keep `settle_index` and `zap_settle_index`
 in `state_dir` across restarts. On upgrade, the zap cursor starts from the existing
 `settle_index` before the HTTP listener starts.
+
+### Webhooks
+
+Under `notifications.webhooks`, give each receiver a name, an HTTPS URL, a list
+of events and its own signing secret. Set either `secret` or `secret_file`.
+Generate a secret for each receiver and give it a copy over a trusted channel.
+
+```sh
+printf 'whsec_%s\n' "$(openssl rand -base64 32)"
+```
+
+| Event | When it fires | Fields in `data` |
+| --- | --- | --- |
+| `invoice.created` | This service creates an address invoice | `amount_msat`, `payment_hash`, `address`, `comment` |
+| `payment.received` | Any invoice on the node settles | `amount_msat`, `payment_hash` |
+| `voucher.claimed` | The voucher payout succeeds | `amount_msat`, `voucher_id` |
+| `voucher.payout_failed` | The node confirms the payout failed | `amount_msat`, `voucher_id` |
+| `voucher.payout_unknown` | The payout result is uncertain and the voucher stays claimed | `amount_msat`, `voucher_id` |
+
+Each JSON POST contains `id`, `type`, `occurred_at` (UTC) and `data`. Verify
+the signature before acting. Use the exact request body and the
+`webhook-id`, `webhook-timestamp` and `webhook-signature` headers with a
+[Standard Webhooks verifier](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md#symmetric-signatures).
+Reject stale delivery timestamps. Record processed IDs alongside the action
+they trigger so a retry cannot repeat it. Return a 2xx status after accepting
+the event.
+
+New endpoints start with new events. Pending deliveries survive restarts under
+`state_dir/webhooks/`. Each endpoint retries temporary failures for up to 72
+hours. Events can arrive out of order. Failed deliveries remain on disk for
+inspection. Removing an endpoint or changing its URL retires its old queue.
 
 ### Diagnostics
 
@@ -150,7 +181,7 @@ holds it in the clear. Generate one with `openssl rand -hex 32`.
 Receipts go to the relays the zap request names, over `wss://` and to public addresses
 only. A relay that refuses one is not retried.
 
-Set `outbound_proxy: "socks5://127.0.0.1:9050"` to send ntfy requests and relay
+Set `outbound_proxy: "socks5://127.0.0.1:9050"` to send ntfy requests, webhook deliveries and relay
 publishing through a SOCKS5 proxy. The node connection is unchanged. The proxy resolves
 relay names and must enforce any address restrictions; the server's public-address
 check applies only to direct relay connections.

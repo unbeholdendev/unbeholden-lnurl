@@ -38,7 +38,8 @@ func NewNtfy(cfg config.NtfyConfig, proxy ...*url.URL) *Ntfy {
 }
 
 // NotifyInvoiceCreated sends a notification when an invoice is created.
-func (n *Ntfy) NotifyInvoiceCreated(amountSats int64, address string, comment string) {
+func (n *Ntfy) NotifyInvoiceCreated(amountMsat int64, _ []byte, address, comment string) {
+	amountSats := amountMsat / 1000
 	body := fmt.Sprintf("Invoice created: %d sats for %s", amountSats, address)
 	if comment != "" {
 		body = fmt.Sprintf("Invoice created: %d sats for %s: %s", amountSats, address, comment)
@@ -56,9 +57,12 @@ func (n *Ntfy) NotifyPayment(invoice lightning.Settled) error {
 	return n.send("Payment received", body)
 }
 
-// NotifyVoucherClaimed sends a notification for a claimed withdraw voucher.
-func (n *Ntfy) NotifyVoucherClaimed(voucherID string, amountSats int64) {
-	body := fmt.Sprintf("Voucher %s claimed (%d sats)", voucherID, amountSats)
+// NotifyVoucher sends a notification for a claimed withdraw voucher.
+func (n *Ntfy) NotifyVoucher(event, voucherID string, amountMsat int64) {
+	if event != "voucher.claimed" {
+		return
+	}
+	body := fmt.Sprintf("Voucher %s claimed (%d sats)", voucherID, amountMsat/1000)
 	n.sendOrLog("Voucher claimed", body)
 }
 

@@ -180,7 +180,7 @@ func (h *AddressHandler) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 
 	address := fmt.Sprintf("%s@%s", username, r.Host)
 	if h.ntfy != nil {
-		h.ntfy.NotifyInvoiceCreated(amountMsat/1000, address, comment)
+		h.ntfy.NotifyInvoiceCreated(amountMsat, invoice.PaymentHash, address, comment)
 	}
 	slog.Info("invoice created", "sats", amountMsat/1000, "address", address)
 

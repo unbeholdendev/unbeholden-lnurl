@@ -145,7 +145,7 @@ func TestHandleInvoice(t *testing.T) {
 	if want := "https://shop.example.com/.well-known/lnurlp/bob/verify/" + node.lastHash(); !strings.HasPrefix(resp["verify"].(string), want) {
 		t.Fatalf("verify = %v, want %s", resp["verify"], want)
 	}
-	if len(node.notified) != 1 || node.notified[0] != "invoice 1 bob@shop.example.com hi" {
+	if len(node.notified) != 1 || node.notified[0] != "invoice 1500 "+node.lastHash()+" bob@shop.example.com hi" {
 		t.Fatalf("notified = %v", node.notified)
 	}
 	if resp := get("amount=999"); resp["status"] != "ERROR" {

@@ -171,16 +171,22 @@ func (h *WithdrawHandler) HandleClaim(w http.ResponseWriter, r *http.Request) {
 		if err := h.release(voucher.ID); err != nil {
 			slog.Error("withdraw release not saved", "voucher", voucher.ID, "err", err)
 		}
+		if h.ntfy != nil {
+			h.ntfy.NotifyVoucher("voucher.payout_failed", voucher.ID, voucher.Amount)
+		}
 		writeError(w, "payment failed")
 		return
 	case err != nil:
 		slog.Error("withdraw payment outcome unknown, voucher left claimed", "voucher", voucher.ID, "err", err)
+		if h.ntfy != nil {
+			h.ntfy.NotifyVoucher("voucher.payout_unknown", voucher.ID, voucher.Amount)
+		}
 		writeError(w, "payment outcome unknown")
 		return
 	}
 
 	if h.ntfy != nil {
-		h.ntfy.NotifyVoucherClaimed(voucher.ID, voucher.Amount/1000)
+		h.ntfy.NotifyVoucher("voucher.claimed", voucher.ID, voucher.Amount)
 	}
 	writeJSON(w, status{Status: "OK"})
 }

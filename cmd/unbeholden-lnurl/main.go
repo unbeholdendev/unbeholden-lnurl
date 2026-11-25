@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"syscall"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"unbeholden-lnurl/internal/nostr"
 	"unbeholden-lnurl/internal/notifier"
 	"unbeholden-lnurl/internal/server"
+	"unbeholden-lnurl/internal/webhook"
 	"unbeholden-lnurl/internal/zap"
 )
 
@@ -152,11 +154,25 @@ func run(ctx context.Context, cfg *config.Config) error {
 	defer node.Close()
 
 	var ntfy *notifier.Ntfy
-	// Kept apart from ntfy: a nil *Ntfy in an interface is not a nil Notifier.
 	var notify lnurl.Notifier
 	if n := cfg.Notifications.Ntfy; n != nil {
 		ntfy = notifier.NewNtfy(*n, cfg.ProxyURL)
 		notify = ntfy
+	}
+	var queue *webhook.Queue
+	endpoints := cfg.Notifications.Webhooks
+	if cfg.StateDir != "" {
+		dir := filepath.Join(cfg.StateDir, "webhooks")
+		_, statErr := os.Stat(dir)
+		if len(endpoints) > 0 || !errors.Is(statErr, os.ErrNotExist) {
+			queue, err = webhook.Open(dir, endpoints, cfg.ProxyURL)
+			if err != nil {
+				return fmt.Errorf("open webhook queue: %w", err)
+			}
+		}
+	}
+	if len(endpoints) > 0 {
+		notify = &notifications{ntfy: ntfy, queue: queue, endpoints: endpoints}
 	}
 
 	var zapper *zap.Zapper
@@ -180,6 +196,18 @@ func run(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("initialise settlement tracking: %w", err)
 	}
+	for name, endpoint := range endpoints {
+		if !slices.Contains(endpoint.Events, "payment.received") {
+			continue
+		}
+		path := queue.Cursor(name)
+		if err := notifier.InitSettled(ctx, node, path); err != nil {
+			return fmt.Errorf("initialise webhook %q settlement tracking: %w", name, err)
+		}
+		watchers = append(watchers, settlementWatcher{path, func(invoice lightning.Settled) error {
+			return queue.Enqueue(name, paymentEvent(invoice))
+		}})
+	}
 	g, ctx := errgroup.WithContext(ctx)
 	if cfg.ServesHTTP() {
 		srv, err := newServer(ctx, cfg, node, notify, zapper)
@@ -192,6 +220,12 @@ func run(ctx context.Context, cfg *config.Config) error {
 		}
 		slog.Info("listening", "addr", ln.Addr().String())
 		g.Go(func() error { return serve(ctx, srv, ln) })
+	}
+	if len(endpoints) > 0 {
+		g.Go(func() error {
+			queue.Run(ctx)
+			return nil
+		})
 	}
 	if zapper != nil {
 		g.Go(func() error {

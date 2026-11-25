@@ -3,9 +3,11 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"image"
 	"image/png"
@@ -326,6 +328,40 @@ func testNotifications(t *testing.T, n *network, binary, node string) {
 	tokenFile := filepath.Join(t.TempDir(), "ntfy-token")
 	write(t, tokenFile, []byte("regtest-token\n"))
 	notifications := fmt.Sprintf("\nnotifications:\n  ntfy:\n    url: %q\n    topic: regtest\n    token_file: %q\n", sink.URL, tokenFile)
+	key := bytes.Repeat([]byte{23}, 32)
+	settled := make(chan string, 8)
+	hook := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(400)
+			return
+		}
+		id := r.Header.Get("webhook-id")
+		mac := hmac.New(sha256.New, key)
+		fmt.Fprintf(mac, "%s.%s.", id, r.Header.Get("webhook-timestamp"))
+		mac.Write(body)
+		var event struct {
+			ID   string
+			Type string
+			Data struct {
+				Amount int64  `json:"amount_msat"`
+				Hash   string `json:"payment_hash"`
+			}
+		}
+		if !hmac.Equal([]byte(r.Header.Get("webhook-signature")), []byte("v1,"+base64.StdEncoding.EncodeToString(mac.Sum(nil)))) ||
+			json.Unmarshal(body, &event) != nil || event.ID != id || event.Type != "payment.received" || event.Data.Amount != 100000 {
+			t.Errorf("invalid signed payment event: %s", body)
+			w.WriteHeader(400)
+			return
+		}
+		settled <- event.Data.Hash
+	}))
+	defer hook.Close()
+	caPath := filepath.Join(t.TempDir(), "receiver.pem")
+	write(t, caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: hook.Certificate().Raw}))
+	t.Setenv("SSL_CERT_FILE", caPath)
+	notifications += fmt.Sprintf("  webhooks:\n    ledger:\n      url: %q\n      events: [payment.received]\n      secret: whsec_%s\n", hook.URL, base64.StdEncoding.EncodeToString(key))
 	s := newService(t, binary, node, addressYAML+notifications)
 	s.start(t, true)
 	first := s.invoice(t, "&comment=paid-during-downtime")
@@ -336,6 +372,14 @@ func testNotifications(t *testing.T, n *network, binary, node string) {
 	case <-attempts:
 	case <-time.After(15 * time.Second):
 		t.Fatal("downtime payment was not retried")
+	}
+	select {
+	case hash := <-settled:
+		if len(hash) != 64 {
+			t.Fatalf("invalid settlement hash %q", hash)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("webhook missed a downtime payment while ntfy was failing")
 	}
 	second := s.invoice(t, "&comment=paid-after-restart")
 	n.pay(t, second.PR)

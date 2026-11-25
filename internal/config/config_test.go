@@ -456,3 +456,63 @@ func TestVerifyKeySurvivesCredentialRotation(t *testing.T) {
 		t.Fatal("credential rotation changed verify key")
 	}
 }
+
+func TestLoadWebhooks(t *testing.T) {
+	inlineKey := strings.Repeat("i", 32)
+	fileKey := strings.Repeat("f", 32)
+	inlineSecret := "whsec_" + base64.StdEncoding.EncodeToString([]byte(inlineKey))
+	fileSecret := "whsec_" + base64.StdEncoding.EncodeToString([]byte(fileKey))
+	path := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(path, []byte(fileSecret+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	events := []string{"invoice.created", "payment.received", "voucher.claimed", "voucher.payout_failed", "voucher.payout_unknown"}
+	input := lndYAML + `
+state_dir: /state
+notifications:
+  webhooks:
+    billing-1:
+      url: https://billing.example/hook?source=ln
+      events: [` + strings.Join(events, ", ") + `]
+      secret: ` + inlineSecret + `
+    ledger:
+      url: https://ledger.example
+      events: [payment.received]
+      secret_file: ` + path
+	cfg, err := Load(writeTestConfig(t, input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Notifies() || cfg.ServesHTTP() {
+		t.Fatal("expected notifications without an HTTP listener")
+	}
+	billing := cfg.Notifications.Webhooks["billing-1"]
+	if billing.URL != "https://billing.example/hook?source=ln" || !slices.Equal(billing.Events, events) ||
+		string(billing.Key) != inlineKey || string(cfg.Notifications.Webhooks["ledger"].Key) != fileKey {
+		t.Fatal("incorrect webhook configuration")
+	}
+
+	for _, tc := range []struct{ name, from, to string }{
+		{"shared key", inlineSecret, fileSecret},
+		{"both secrets", "secret_file: ", "secret: " + inlineSecret + "\n      secret_file: "},
+		{"missing secret", "secret: " + inlineSecret, ""},
+		{"missing file", path, path + ".missing"},
+		{"missing prefix", inlineSecret, strings.TrimPrefix(inlineSecret, "whsec_")},
+		{"bad encoding", inlineSecret, "whsec_!!!!"},
+		{"short key", inlineSecret, "whsec_YQ=="},
+		{"http", "https://ledger", "http://ledger"},
+		{"missing host", "https://ledger.example", "https:///hook"},
+		{"userinfo", "https://ledger", "https://user@ledger"},
+		{"fragment", "ledger.example", "ledger.example#frag"},
+		{"unsafe name", "billing-1:", "../billing:"},
+		{"empty events", "[payment.received]", "[]"},
+		{"unknown event", "[payment.received]", "[payment.failed]"},
+		{"missing state", "state_dir: /state", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Load(writeTestConfig(t, strings.Replace(input, tc.from, tc.to, 1))); err == nil {
+				t.Fatal("expected invalid webhook configuration to fail")
+			}
+		})
+	}
+}

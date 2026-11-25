@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
@@ -84,7 +85,52 @@ type CLNConfig struct {
 }
 
 type NotificationsConfig struct {
-	Ntfy *NtfyConfig `yaml:"ntfy,omitempty"`
+	Webhooks map[string]WebhookConfig `yaml:"webhooks,omitempty"`
+	Ntfy     *NtfyConfig              `yaml:"ntfy,omitempty"`
+}
+
+type WebhookConfig struct {
+	URL        string   `yaml:"url"`
+	Events     []string `yaml:"events"`
+	Secret     string   `yaml:"secret,omitempty"`
+	SecretFile string   `yaml:"secret_file,omitempty"`
+	Key        []byte   `yaml:"-"`
+}
+
+var webhookName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+func (w WebhookConfig) signingKey() ([]byte, error) {
+	u, err := url.Parse(w.URL)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || strings.Contains(w.URL, "#") {
+		return nil, fmt.Errorf("url must be HTTPS with a host and without userinfo or a fragment")
+	}
+	if len(w.Events) == 0 {
+		return nil, fmt.Errorf("events must contain at least one event")
+	}
+	for _, event := range w.Events {
+		switch event {
+		case "invoice.created", "payment.received", "voucher.claimed", "voucher.payout_failed", "voucher.payout_unknown":
+		default:
+			return nil, fmt.Errorf("unknown event %q", event)
+		}
+	}
+	if (w.Secret == "") == (w.SecretFile == "") {
+		return nil, fmt.Errorf("set exactly one of secret or secret_file")
+	}
+	secret := w.Secret
+	if w.SecretFile != "" {
+		data, err := os.ReadFile(w.SecretFile)
+		if err != nil {
+			return nil, fmt.Errorf("read secret_file: %w", err)
+		}
+		secret = strings.TrimSpace(string(data))
+	}
+	encoded, ok := strings.CutPrefix(secret, "whsec_")
+	key, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	if !ok || err != nil || len(key) != 32 || strings.ContainsAny(encoded, "\r\n") {
+		return nil, fmt.Errorf("secret must be whsec_ followed by 32 base64-encoded bytes")
+	}
+	return key, nil
 }
 
 type NtfyConfig struct {
@@ -285,6 +331,22 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("notifications.ntfy: set token or token_file, not both")
 		}
 	}
+	keys := make(map[string]string)
+	for name, hook := range c.Notifications.Webhooks {
+		if !webhookName.MatchString(name) {
+			return fmt.Errorf("invalid notifications.webhooks endpoint name %q", name)
+		}
+		key, err := hook.signingKey()
+		if err != nil {
+			return fmt.Errorf("notifications.webhooks.%s: %w", name, err)
+		}
+		if other, ok := keys[string(key)]; ok {
+			return fmt.Errorf("notifications.webhooks: %q and %q share a signing key", name, other)
+		}
+		keys[string(key)] = name
+		hook.Key = key
+		c.Notifications.Webhooks[name] = hook
+	}
 	if c.WithdrawSecret != "" && c.WithdrawSecretFile != "" {
 		return fmt.Errorf("set withdraw_secret or withdraw_secret_file, not both")
 	}
@@ -332,7 +394,7 @@ func (c *Config) ServesHTTP() bool {
 
 // Notifies reports whether any notification channel is configured.
 func (c *Config) Notifies() bool {
-	return c.Notifications.Ntfy != nil
+	return c.Notifications.Ntfy != nil || len(c.Notifications.Webhooks) > 0
 }
 
 // ExpandVouchers expands batch withdraw entries into individual Voucher structs.

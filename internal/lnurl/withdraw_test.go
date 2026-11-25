@@ -87,16 +87,16 @@ func (f *fakeNode) settle(hash string, preimage []byte) {
 	f.invoices[hash] = invoice
 }
 
-func (f *fakeNode) NotifyVoucherClaimed(voucherID string, amountSats int64) {
+func (f *fakeNode) NotifyVoucher(event, voucherID string, amountMsat int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.notified = append(f.notified, fmt.Sprintf("claimed %s %d", voucherID, amountSats))
+	f.notified = append(f.notified, fmt.Sprintf("%s %s %d", event, voucherID, amountMsat))
 }
 
-func (f *fakeNode) NotifyInvoiceCreated(amountSats int64, address, comment string) {
+func (f *fakeNode) NotifyInvoiceCreated(amountMsat int64, hash []byte, address, comment string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.notified = append(f.notified, fmt.Sprintf("invoice %d %s %s", amountSats, address, comment))
+	f.notified = append(f.notified, fmt.Sprintf("invoice %d %x %s %s", amountMsat, hash, address, comment))
 }
 
 var testVoucher = config.Voucher{ID: "tip-001", Token: "abc123", Domain: "example.com", Description: "tip", Amount: 1_000_000}
@@ -216,7 +216,7 @@ func TestWithdraw_ClaimPaysOnce(t *testing.T) {
 	if node.payments != 1 {
 		t.Fatalf("payments = %d, want 1", node.payments)
 	}
-	if len(node.notified) != 1 || node.notified[0] != "claimed tip-001 1000" {
+	if len(node.notified) != 1 || node.notified[0] != "voucher.claimed tip-001 1000000" {
 		t.Fatalf("notified = %v", node.notified)
 	}
 	if !claimedOnDisk(t, statePath) {
@@ -250,6 +250,9 @@ func TestWithdraw_UnknownOutcomeKeepsClaim(t *testing.T) {
 	if node.payments != 1 {
 		t.Fatalf("payments = %d, want 1", node.payments)
 	}
+	if len(node.notified) != 1 || node.notified[0] != "voucher.payout_unknown tip-001 1000000" {
+		t.Fatalf("notified = %v", node.notified)
+	}
 	if !claimedOnDisk(t, statePath) {
 		t.Fatal("claim with unknown outcome not persisted")
 	}
@@ -279,6 +282,9 @@ func TestWithdraw_DefiniteFailureReleases(t *testing.T) {
 	h := newWithdraw(t, node, statePath)
 
 	wantStatus(t, claim(t, h), "ERROR", "payment failed")
+	if len(node.notified) != 1 || node.notified[0] != "voucher.payout_failed tip-001 1000000" {
+		t.Fatalf("notified = %v", node.notified)
+	}
 	if claimedOnDisk(t, statePath) {
 		t.Fatal("failed claim still persisted")
 	}
