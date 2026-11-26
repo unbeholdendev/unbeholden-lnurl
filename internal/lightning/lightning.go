@@ -13,6 +13,27 @@ import (
 // reports the payment as failed, so no part of it can still settle.
 var ErrPaymentFailed = errors.New("payment failed")
 
+// ErrPaymentNotFound is returned by a backend's LookupPayment when the node
+// has no payment for the hash.
+var ErrPaymentNotFound = errors.New("payment not found")
+
+// PaymentStatus is where an outgoing payment stands on the node.
+type PaymentStatus string
+
+const (
+	PaymentPending   PaymentStatus = "pending"
+	PaymentSucceeded PaymentStatus = "succeeded"
+	PaymentFailed    PaymentStatus = "failed"
+)
+
+// Payment is an outgoing payment on the node. Preimage and FeeMsat are set
+// once it has succeeded.
+type Payment struct {
+	Status   PaymentStatus
+	Preimage []byte
+	FeeMsat  int64
+}
+
 // Invoice is an invoice on the node.
 type Invoice struct {
 	PaymentRequest string
@@ -30,6 +51,12 @@ type Settled struct {
 	PaymentRequest string
 	Preimage       []byte
 	SettledAt      time.Time
+}
+
+// DefaultMaxFee is the fee limit for a payment of amountMsat: 1%, but at
+// least 10 sat.
+func DefaultMaxFee(amountMsat int64) int64 {
+	return max(amountMsat/100, 10000)
 }
 
 // ErrInvoiceNotFound is returned by a backend's LookupInvoice for an unknown

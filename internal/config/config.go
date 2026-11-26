@@ -35,6 +35,23 @@ type Config struct {
 	Withdraw           []WithdrawConfig        `yaml:"withdraw,omitempty"`
 	Addresses          map[string]AddressEntry `yaml:"addresses,omitempty"`
 	Nostr              *NostrConfig            `yaml:"nostr,omitempty"`
+	Payments           PaymentsConfig          `yaml:"payments,omitempty"`
+}
+
+// PaymentsConfig lets the named clients make payments from the node.
+type PaymentsConfig struct {
+	Clients map[string]PaymentClient `yaml:"clients"`
+}
+
+// PaymentClient is an application allowed to make payments. Unset limits do
+// not apply; MaxFee defaults to lightning.DefaultMaxFee.
+type PaymentClient struct {
+	Token       string   `yaml:"token,omitempty"`
+	TokenFile   string   `yaml:"token_file,omitempty"`
+	AllowedIPs  []Prefix `yaml:"allowed_ips,omitempty"`
+	MaxPayment  int64    `yaml:"max_payment,omitempty"`
+	DailyBudget int64    `yaml:"daily_budget,omitempty"`
+	MaxFee      int64    `yaml:"max_fee,omitempty"`
 }
 
 // NostrConfig turns on zaps (NIP-57) for every address.
@@ -53,7 +70,7 @@ func (p *Prefix) UnmarshalText(text []byte) error {
 	if err != nil {
 		addr, addrErr := netip.ParseAddr(s)
 		if addrErr != nil {
-			return fmt.Errorf("trusted_proxies: %q is not an IP address or CIDR range", s)
+			return fmt.Errorf("%q is not an IP address or CIDR range", s)
 		}
 		addr = addr.Unmap()
 		prefix = netip.PrefixFrom(addr, addr.BitLen())
@@ -97,7 +114,7 @@ type WebhookConfig struct {
 	Key        []byte   `yaml:"-"`
 }
 
-var webhookName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+var entryName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 func (w WebhookConfig) signingKey() ([]byte, error) {
 	u, err := url.Parse(w.URL)
@@ -109,7 +126,7 @@ func (w WebhookConfig) signingKey() ([]byte, error) {
 	}
 	for _, event := range w.Events {
 		switch event {
-		case "invoice.created", "payment.received", "voucher.claimed", "voucher.payout_failed", "voucher.payout_unknown":
+		case "invoice.created", "payment.received", "payment.sent", "payment.failed", "voucher.claimed", "voucher.payout_failed", "voucher.payout_unknown":
 		default:
 			return nil, fmt.Errorf("unknown event %q", event)
 		}
@@ -173,6 +190,7 @@ type Voucher struct {
 
 const (
 	minWithdrawSecretLen = 32
+	minPaymentTokenLen   = 32
 	maxImageLen          = 136536
 	maxSuccessMessageLen = 144
 )
@@ -250,6 +268,9 @@ func Load(path string) (*Config, error) {
 		}
 		n.PrivateKey = strings.TrimSpace(string(key))
 	}
+	if err := cfg.Payments.loadTokens(); err != nil {
+		return nil, err
+	}
 	if n := cfg.Notifications.Ntfy; n != nil && n.TokenFile != "" {
 		token, err := os.ReadFile(n.TokenFile)
 		if err != nil {
@@ -267,6 +288,28 @@ func Load(path string) (*Config, error) {
 		cfg.Addresses[name] = addr
 	}
 	return &cfg, nil
+}
+
+func (p PaymentsConfig) loadTokens() error {
+	clients := make(map[string]string)
+	for name, client := range p.Clients {
+		if client.TokenFile != "" {
+			token, err := os.ReadFile(client.TokenFile)
+			if err != nil {
+				return fmt.Errorf("read payments.clients.%s.token_file: %w", name, err)
+			}
+			client.Token = strings.TrimSpace(string(token))
+			p.Clients[name] = client
+		}
+		if len(client.Token) < minPaymentTokenLen {
+			return fmt.Errorf("payments.clients.%s: token must be at least %d characters", name, minPaymentTokenLen)
+		}
+		if other, ok := clients[client.Token]; ok {
+			return fmt.Errorf("payments.clients: %q and %q share a token", name, other)
+		}
+		clients[client.Token] = name
+	}
+	return nil
 }
 
 func (a *AddressEntry) loadImage() error {
@@ -304,16 +347,27 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("cln needs url and rune_file")
 	}
 	if !c.ServesHTTP() && !c.Notifies() {
-		return fmt.Errorf("nothing to do: configure addresses, withdraw or notifications")
+		return fmt.Errorf("nothing to do: configure addresses, withdraw, payments or notifications")
 	}
 	if c.ServesHTTP() && c.Listen == "" {
-		return fmt.Errorf("listen is required with addresses or withdraw vouchers")
+		return fmt.Errorf("listen is required with addresses, withdraw vouchers or payments")
 	}
 	if c.RateLimit.PerMinute <= 0 || c.RateLimit.Burst <= 0 {
 		return fmt.Errorf("rate_limit.per_minute and rate_limit.burst must be positive")
 	}
-	if (c.Notifies() || len(c.Withdraw) > 0 || c.Nostr != nil) && c.StateDir == "" {
-		return fmt.Errorf("state_dir is required with notifications, withdraw vouchers or nostr")
+	if (c.Notifies() || len(c.Withdraw) > 0 || c.Nostr != nil || len(c.Payments.Clients) > 0) && c.StateDir == "" {
+		return fmt.Errorf("state_dir is required with notifications, withdraw vouchers, nostr or payments")
+	}
+	for name, client := range c.Payments.Clients {
+		if !entryName.MatchString(name) {
+			return fmt.Errorf("invalid payments.clients name %q", name)
+		}
+		if (client.Token == "") == (client.TokenFile == "") {
+			return fmt.Errorf("payments.clients.%s: set exactly one of token or token_file", name)
+		}
+		if client.MaxPayment < 0 || client.DailyBudget < 0 || client.MaxFee < 0 {
+			return fmt.Errorf("payments.clients.%s: max_payment, daily_budget and max_fee must not be negative", name)
+		}
 	}
 	if n := c.Nostr; n != nil {
 		if len(c.Addresses) == 0 {
@@ -333,7 +387,7 @@ func (c *Config) Validate() error {
 	}
 	keys := make(map[string]string)
 	for name, hook := range c.Notifications.Webhooks {
-		if !webhookName.MatchString(name) {
+		if !entryName.MatchString(name) {
 			return fmt.Errorf("invalid notifications.webhooks endpoint name %q", name)
 		}
 		key, err := hook.signingKey()
@@ -389,7 +443,7 @@ func (c *Config) Validate() error {
 
 // ServesHTTP reports whether any configured feature needs the HTTP listener.
 func (c *Config) ServesHTTP() bool {
-	return len(c.Addresses) > 0 || len(c.Withdraw) > 0
+	return len(c.Addresses) > 0 || len(c.Withdraw) > 0 || len(c.Payments.Clients) > 0
 }
 
 // Notifies reports whether any notification channel is configured.

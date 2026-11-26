@@ -10,6 +10,7 @@ import (
 	"unbeholden-lnurl/internal/config"
 	"unbeholden-lnurl/internal/lightning"
 	"unbeholden-lnurl/internal/notifier"
+	"unbeholden-lnurl/internal/payments"
 	"unbeholden-lnurl/internal/webhook"
 )
 
@@ -48,6 +49,20 @@ func (n *notifications) NotifyVoucher(kind, voucherID string, amountMsat int64) 
 	if n.ntfy != nil {
 		n.ntfy.NotifyVoucher(kind, voucherID, amountMsat)
 	}
+}
+
+func (n *notifications) NotifyPayment(client string, payment payments.Payment) {
+	kind := "payment.sent"
+	if payment.Status == lightning.PaymentFailed {
+		kind = "payment.failed"
+	}
+	n.enqueue(webhook.Event{
+		ID: kind + "/" + client + "/" + payment.ID, Type: kind, OccurredAt: *payment.CompletedAt,
+		Data: map[string]any{
+			"client": client, "id": payment.ID, "amount_msat": payment.AmountMsat, "fee_msat": payment.FeeMsat,
+			"payment_hash": payment.PaymentHash, "destination": payment.Destination,
+		},
+	})
 }
 
 func paymentEvent(invoice lightning.Settled) webhook.Event {

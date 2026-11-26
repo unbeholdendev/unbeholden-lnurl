@@ -22,7 +22,8 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Router_SendPaymentV2_FullMethodName = "/routerrpc.Router/SendPaymentV2"
+	Router_SendPaymentV2_FullMethodName  = "/routerrpc.Router/SendPaymentV2"
+	Router_TrackPaymentV2_FullMethodName = "/routerrpc.Router/TrackPaymentV2"
 )
 
 // RouterClient is the client API for Router service.
@@ -30,6 +31,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type RouterClient interface {
 	SendPaymentV2(ctx context.Context, in *SendPaymentRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[lnrpc.Payment], error)
+	TrackPaymentV2(ctx context.Context, in *TrackPaymentRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[lnrpc.Payment], error)
 }
 
 type routerClient struct {
@@ -59,11 +61,31 @@ func (c *routerClient) SendPaymentV2(ctx context.Context, in *SendPaymentRequest
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Router_SendPaymentV2Client = grpc.ServerStreamingClient[lnrpc.Payment]
 
+func (c *routerClient) TrackPaymentV2(ctx context.Context, in *TrackPaymentRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[lnrpc.Payment], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Router_ServiceDesc.Streams[1], Router_TrackPaymentV2_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[TrackPaymentRequest, lnrpc.Payment]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Router_TrackPaymentV2Client = grpc.ServerStreamingClient[lnrpc.Payment]
+
 // RouterServer is the server API for Router service.
 // All implementations must embed UnimplementedRouterServer
 // for forward compatibility.
 type RouterServer interface {
 	SendPaymentV2(*SendPaymentRequest, grpc.ServerStreamingServer[lnrpc.Payment]) error
+	TrackPaymentV2(*TrackPaymentRequest, grpc.ServerStreamingServer[lnrpc.Payment]) error
 	mustEmbedUnimplementedRouterServer()
 }
 
@@ -76,6 +98,9 @@ type UnimplementedRouterServer struct{}
 
 func (UnimplementedRouterServer) SendPaymentV2(*SendPaymentRequest, grpc.ServerStreamingServer[lnrpc.Payment]) error {
 	return status.Error(codes.Unimplemented, "method SendPaymentV2 not implemented")
+}
+func (UnimplementedRouterServer) TrackPaymentV2(*TrackPaymentRequest, grpc.ServerStreamingServer[lnrpc.Payment]) error {
+	return status.Error(codes.Unimplemented, "method TrackPaymentV2 not implemented")
 }
 func (UnimplementedRouterServer) mustEmbedUnimplementedRouterServer() {}
 func (UnimplementedRouterServer) testEmbeddedByValue()                {}
@@ -109,6 +134,17 @@ func _Router_SendPaymentV2_Handler(srv interface{}, stream grpc.ServerStream) er
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Router_SendPaymentV2Server = grpc.ServerStreamingServer[lnrpc.Payment]
 
+func _Router_TrackPaymentV2_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(TrackPaymentRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(RouterServer).TrackPaymentV2(m, &grpc.GenericServerStream[TrackPaymentRequest, lnrpc.Payment]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Router_TrackPaymentV2Server = grpc.ServerStreamingServer[lnrpc.Payment]
+
 // Router_ServiceDesc is the grpc.ServiceDesc for Router service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -120,6 +156,11 @@ var Router_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "SendPaymentV2",
 			Handler:       _Router_SendPaymentV2_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "TrackPaymentV2",
+			Handler:       _Router_TrackPaymentV2_Handler,
 			ServerStreams: true,
 		},
 	},

@@ -102,7 +102,7 @@ func checkDiagnosticNode(ctx context.Context, cfg *config.Config) error {
 			return fmt.Errorf("read invoices: %w", err)
 		}
 	}
-	if len(cfg.Withdraw) > 0 {
+	if len(cfg.Withdraw) > 0 || len(cfg.Payments.Clients) > 0 {
 		if _, err := n.Network(ctx); err != nil {
 			return fmt.Errorf("read node network: %w", err)
 		}

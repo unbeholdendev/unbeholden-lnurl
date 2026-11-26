@@ -7,15 +7,19 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/chaincfg"
+
 	"unbeholden-lnurl/internal/config"
 	"unbeholden-lnurl/internal/lnurl"
+	"unbeholden-lnurl/internal/payments"
 )
 
 func TestNew_ShutdownBeforeServe(t *testing.T) {
-	srv := New(nil, config.DefaultRateLimit, nil, nil)
+	srv := New(nil, config.DefaultRateLimit, nil, nil, nil)
 	if err := srv.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +40,7 @@ func TestNew_ShutdownBeforeServe(t *testing.T) {
 }
 
 func TestNew_Timeouts(t *testing.T) {
-	srv := New(nil, config.DefaultRateLimit, nil, nil)
+	srv := New(nil, config.DefaultRateLimit, nil, nil, nil)
 	if srv.ReadHeaderTimeout <= 0 || srv.ReadTimeout <= 0 || srv.IdleTimeout <= 0 {
 		t.Fatalf("read header %s, read %s, idle %s: want all set", srv.ReadHeaderTimeout, srv.ReadTimeout, srv.IdleTimeout)
 	}
@@ -92,7 +96,7 @@ func TestNew_ForwardedHostOnlyFromTrustedProxy(t *testing.T) {
 	address := lnurl.NewAddressHandler(map[string]config.AddressEntry{
 		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
 	}, nil, nil, []byte("verify key"), nil)
-	srv := New(trustedProxies(t, "10.0.0.0/8"), config.DefaultRateLimit, nil, address)
+	srv := New(trustedProxies(t, "10.0.0.0/8"), config.DefaultRateLimit, nil, address, nil)
 
 	for remote, want := range map[string]string{
 		"10.0.0.1:1234":    "https://shop.example.com/.well-known/lnurlp/bob/invoice",
@@ -124,7 +128,7 @@ func TestNew_CrossOriginLNURL(t *testing.T) {
 		"/.well-known/lnurlp/unknown",
 	} {
 		t.Run(path, func(t *testing.T) {
-			srv := New(nil, config.RateLimit{PerMinute: 1, Burst: 1}, nil, address)
+			srv := New(nil, config.RateLimit{PerMinute: 1, Burst: 1}, nil, address, nil)
 			for i := range 2 {
 				req := httptest.NewRequest(http.MethodGet, "https://pay.example.com"+path, nil)
 				req.Header.Set("Origin", "https://jumble.social")
@@ -141,5 +145,35 @@ func TestNew_CrossOriginLNURL(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestNew_PaymentsWithoutCORS(t *testing.T) {
+	const token = "shop-token-at-least-32-characters"
+	pay, err := payments.New(context.Background(), map[string]config.PaymentClient{
+		"shop": {Token: token, AllowedIPs: trustedProxies(t, "192.0.2.9")},
+	}, nil, nil, nil, &chaincfg.MainNetParams, filepath.Join(t.TempDir(), "payments.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(trustedProxies(t, "10.0.0.0/8"), config.DefaultRateLimit, nil, nil, pay)
+	for _, tc := range []struct {
+		path, remote, forwarded string
+		want                    int
+	}{
+		{"/payments", "10.0.0.1:1", "192.0.2.9", http.StatusOK},
+		{"/payments", "192.0.2.10:1", "192.0.2.9", http.StatusForbidden},
+		{"/payments/x", "10.0.0.1:1", "192.0.2.9", http.StatusNotFound},
+	} {
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		req.RemoteAddr = tc.remote
+		req.Header.Set("X-Forwarded-For", tc.forwarded)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Origin", "https://evil.example")
+		rec := httptest.NewRecorder()
+		srv.Handler.ServeHTTP(rec, req)
+		if rec.Code != tc.want || rec.Header().Get("Access-Control-Allow-Origin") != "" {
+			t.Errorf("%s from %s: status %d, CORS %q", tc.path, tc.remote, rec.Code, rec.Header().Get("Access-Control-Allow-Origin"))
+		}
 	}
 }

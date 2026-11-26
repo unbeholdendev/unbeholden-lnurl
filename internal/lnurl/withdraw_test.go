@@ -37,14 +37,14 @@ type fakeNode struct {
 	description, memo string
 }
 
-func (f *fakeNode) SendPayment(ctx context.Context, _ string, _ int64) error {
+func (f *fakeNode) SendPayment(ctx context.Context, _ string, _ int64) (lightning.Payment, error) {
 	f.mu.Lock()
 	f.payments++
 	f.mu.Unlock()
 	if f.pay != nil {
-		return f.pay(ctx)
+		return lightning.Payment{}, f.pay(ctx)
 	}
-	return nil
+	return lightning.Payment{Status: lightning.PaymentSucceeded}, nil
 }
 
 func (f *fakeNode) AddInvoice(_ context.Context, amountMsat int64, description, memo string) (lightning.Invoice, error) {

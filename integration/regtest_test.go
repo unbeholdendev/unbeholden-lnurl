@@ -92,6 +92,7 @@ func TestRegtest(t *testing.T) {
 				t.Run("AddressOptionsAndVerificationSurviveRestart", func(t *testing.T) { testAddress(t, n, binary, node) })
 				t.Run("ConfiguredRateLimitAndProxyTrust", func(t *testing.T) { testRateLimit(t, binary, node) })
 				t.Run("WithdrawClaimSurvivesRestart", func(t *testing.T) { testWithdraw(t, n, binary, node) })
+				t.Run("PaymentsReconcileAfterRestart", func(t *testing.T) { testPayments(t, n, binary, node) })
 				t.Run("ZapRecoveryWithoutNotifications", func(t *testing.T) { testZap(t, n, binary, node) })
 			})
 		}
@@ -539,6 +540,74 @@ withdraw:
 	out, err := exec.CommandContext(ctx, binary, "-config", s.configPath).CombinedOutput()
 	if err == nil || ctx.Err() != nil || !strings.Contains(string(out), "load withdraw state") {
 		t.Fatalf("corrupt state did not fail startup: %v\n%s", err, out)
+	}
+}
+
+func (s *service) payments(t *testing.T, method, path, body string) (int, map[string]any) {
+	t.Helper()
+	req, err := http.NewRequest(method, "http://"+s.address+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer regtest-payments-token-of-32-characters")
+	resp, err := (&http.Client{Timeout: 3 * time.Minute}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	return resp.StatusCode, got
+}
+
+func testPayments(t *testing.T, n *network, binary, node string) {
+	s := newService(t, binary, node, `
+payments:
+  clients:
+    regtest:
+      token: regtest-payments-token-of-32-characters
+      max_payment: 200000
+`)
+	s.start(t, true)
+	invoice := n.invoice(t, 150000)
+	body := fmt.Sprintf(`{"id":"order-1","invoice":%q}`, invoice)
+	code, paid := s.payments(t, "POST", "/payments", body)
+	invoices := run(t, n.payer, "-k", "listinvoices", "invstring="+invoice)["invoices"].([]any)
+	if code != 200 || paid["status"] != "succeeded" || paid["preimage"] != invoices[0].(map[string]any)["payment_preimage"] {
+		t.Fatalf("pay: %d %v", code, paid)
+	}
+	if code, again := s.payments(t, "POST", "/payments", body); code != 200 || again["completed_at"] != paid["completed_at"] {
+		t.Fatalf("retry: %d %v", code, again)
+	}
+	if code, _ := s.payments(t, "POST", "/payments", fmt.Sprintf(`{"id":"too-big","invoice":%q}`, n.invoice(t, 300000))); code != 403 {
+		t.Fatalf("over max_payment: %d", code)
+	}
+
+	s.stop(t)
+	statePath := filepath.Join(s.stateDir, "payments.json")
+	var state map[string][]map[string]any
+	data, err := os.ReadFile(statePath)
+	if err != nil || json.Unmarshal(data, &state) != nil || len(state["payments"]) != 1 {
+		t.Fatalf("payments state: %v %s", err, data)
+	}
+	pending := state["payments"][0]
+	pending["status"], pending["preimage"], pending["completed_at"], pending["fee_msat"] = "pending", nil, nil, 0
+	unknown := map[string]any{}
+	for k, v := range pending {
+		unknown[k] = v
+	}
+	unknown["id"], unknown["payment_hash"], unknown["created_at"] = "never-sent", strings.Repeat("00", 32), time.Now().Add(-time.Hour)
+	state["payments"] = append(state["payments"], unknown)
+	data, _ = json.Marshal(state)
+	write(t, statePath, data)
+	s.start(t, true)
+	if _, got := s.payments(t, "GET", "/payments/order-1", ""); got["status"] != "succeeded" || got["preimage"] != paid["preimage"] || got["fee_msat"] != paid["fee_msat"] {
+		t.Fatalf("reconciled payment: %v, want %v", got, paid)
+	}
+	if _, got := s.payments(t, "GET", "/payments/never-sent", ""); got["status"] != "failed" {
+		t.Fatalf("payment unknown to the node: %v", got)
 	}
 }
 

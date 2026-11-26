@@ -109,32 +109,68 @@ func (c *Client) LookupInvoice(ctx context.Context, paymentHash []byte) (lightni
 	return invoice, nil
 }
 
-// SendPayment pays a BOLT-11 invoice. An error wrapping
-// lightning.ErrPaymentFailed means
-// the payment definitely failed; any other error leaves the outcome unknown.
-// Cancelling ctx stops waiting but does not stop the payment.
-func (c *Client) SendPayment(ctx context.Context, bolt11 string, maxFeeSat int64) error {
+// SendPayment pays a BOLT-11 invoice, spending at most maxFeeMsat in fees.
+// An error wrapping lightning.ErrPaymentFailed means the payment definitely
+// failed; any other error leaves the outcome unknown. Cancelling ctx stops
+// waiting but does not stop the payment.
+func (c *Client) SendPayment(ctx context.Context, bolt11 string, maxFeeMsat int64) (lightning.Payment, error) {
 	stream, err := c.router.SendPaymentV2(ctx, &routerrpc.SendPaymentRequest{
 		PaymentRequest: bolt11,
 		TimeoutSeconds: 60,
-		FeeLimitSat:    maxFeeSat,
+		FeeLimitMsat:   maxFeeMsat,
 		MaxParts:       16,
 	})
 	if err != nil {
-		return fmt.Errorf("send payment: %w", err)
+		return lightning.Payment{}, fmt.Errorf("send payment: %w", err)
 	}
-
 	for {
-		payment, err := stream.Recv()
+		update, err := stream.Recv()
 		if err != nil {
-			return fmt.Errorf("recv payment update: %w", err)
+			return lightning.Payment{}, fmt.Errorf("recv payment update: %w", err)
 		}
-		switch payment.Status {
-		case lnrpc.Payment_SUCCEEDED:
-			return nil
-		case lnrpc.Payment_FAILED:
-			return fmt.Errorf("%w: %s", lightning.ErrPaymentFailed, payment.FailureReason)
+		payment, err := toPayment(update)
+		switch {
+		case err != nil:
+			return lightning.Payment{}, err
+		case payment.Status == lightning.PaymentFailed:
+			return lightning.Payment{}, fmt.Errorf("%w: %s", lightning.ErrPaymentFailed, update.FailureReason)
+		case payment.Status == lightning.PaymentSucceeded:
+			return payment, nil
 		}
+	}
+}
+
+// LookupPayment returns the outgoing payment for paymentHash, or
+// lightning.ErrPaymentNotFound.
+func (c *Client) LookupPayment(ctx context.Context, paymentHash []byte) (lightning.Payment, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stream, err := c.router.TrackPaymentV2(ctx, &routerrpc.TrackPaymentRequest{PaymentHash: paymentHash})
+	if err != nil {
+		return lightning.Payment{}, fmt.Errorf("track payment: %w", err)
+	}
+	payment, err := stream.Recv()
+	if status.Code(err) == codes.NotFound {
+		return lightning.Payment{}, lightning.ErrPaymentNotFound
+	}
+	if err != nil {
+		return lightning.Payment{}, fmt.Errorf("track payment: %w", err)
+	}
+	return toPayment(payment)
+}
+
+func toPayment(payment *lnrpc.Payment) (lightning.Payment, error) {
+	switch payment.Status {
+	case lnrpc.Payment_SUCCEEDED:
+		preimage, err := hex.DecodeString(payment.PaymentPreimage)
+		if err != nil {
+			return lightning.Payment{}, fmt.Errorf("payment preimage: %w", err)
+		}
+		return lightning.Payment{Status: lightning.PaymentSucceeded, Preimage: preimage, FeeMsat: payment.FeeMsat}, nil
+	case lnrpc.Payment_FAILED:
+		return lightning.Payment{Status: lightning.PaymentFailed}, nil
+	default:
+		return lightning.Payment{Status: lightning.PaymentPending}, nil
 	}
 }
 

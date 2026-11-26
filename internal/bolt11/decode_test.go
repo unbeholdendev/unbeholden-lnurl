@@ -3,6 +3,7 @@ package bolt11
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -104,6 +105,9 @@ func TestPublishedInvoice(t *testing.T) {
 		invoice, err := Decode(pr, &chaincfg.MainNetParams)
 		if err != nil || invoice.AmountMsat != nil || invoice.Timestamp.Unix() != 1496314658 {
 			t.Fatalf("invoice = %+v, %v", invoice, err)
+		}
+		if hash := hex.EncodeToString(invoice.PaymentHash[:]); hash != "0001020304050607080900010203040506070809000102030405060708090102" {
+			t.Fatalf("payment hash = %s", hash)
 		}
 	}
 	if _, err := Decode(request[:len(request)-1]+"q", &chaincfg.MainNetParams); err == nil {

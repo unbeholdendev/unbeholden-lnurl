@@ -30,9 +30,10 @@ const PayTimeout = 2 * time.Minute
 
 // Payer pays BOLT-11 invoices.
 type Payer interface {
-	// SendPayment pays bolt11. An error wrapping lightning.ErrPaymentFailed means
-	// the payment definitely failed; any other error leaves it unknown.
-	SendPayment(ctx context.Context, bolt11 string, maxFeeSat int64) error
+	// SendPayment pays bolt11, spending at most maxFeeMsat in fees. An error
+	// wrapping lightning.ErrPaymentFailed means the payment definitely failed;
+	// any other error leaves it unknown.
+	SendPayment(ctx context.Context, bolt11 string, maxFeeMsat int64) (lightning.Payment, error)
 }
 
 // WithdrawHandler handles LNURL-withdraw protocol requests.
@@ -163,8 +164,7 @@ func (h *WithdrawHandler) HandleClaim(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), PayTimeout)
 	defer cancel()
-	maxFeeSat := max(voucher.Amount/100000, 10)
-	err = h.payer.SendPayment(ctx, pr, maxFeeSat)
+	_, err = h.payer.SendPayment(ctx, pr, lightning.DefaultMaxFee(voucher.Amount))
 	switch {
 	case errors.Is(err, lightning.ErrPaymentFailed):
 		slog.Warn("withdraw payment failed", "voucher", voucher.ID, "err", err)

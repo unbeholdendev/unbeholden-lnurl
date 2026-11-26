@@ -171,48 +171,88 @@ func (c *Client) LookupInvoice(ctx context.Context, paymentHash []byte) (lightni
 	return invoice, nil
 }
 
-// SendPayment pays a BOLT-11 invoice. An error wrapping
-// lightning.ErrPaymentFailed means the payment definitely failed; any other
-// error leaves the outcome unknown. Cancelling ctx stops waiting but does not
-// stop the payment.
-func (c *Client) SendPayment(ctx context.Context, bolt11 string, maxFeeSat int64) error {
-	var paid struct {
-		Status string `json:"status"`
-	}
+// SendPayment pays a BOLT-11 invoice, spending at most maxFeeMsat in fees.
+// An error wrapping lightning.ErrPaymentFailed means the payment definitely
+// failed; any other error leaves the outcome unknown. Cancelling ctx stops
+// waiting but does not stop the payment.
+func (c *Client) SendPayment(ctx context.Context, bolt11 string, maxFeeMsat int64) (lightning.Payment, error) {
+	var paid pay
 	err := c.call(ctx, "pay", map[string]any{
 		"bolt11":    bolt11,
-		"maxfee":    maxFeeSat * 1000,
+		"maxfee":    maxFeeMsat,
 		"retry_for": 60,
 	}, &paid)
 	var rpcErr *rpcError
 	switch {
 	case err == nil && paid.Status == "complete":
-		return nil
+		return paid.payment()
 	case err == nil:
-		return fmt.Errorf("pay: status %s", paid.Status)
+		return lightning.Payment{}, fmt.Errorf("pay: status %s", paid.Status)
 	case !errors.As(err, &rpcErr):
-		return err
+		return lightning.Payment{}, err
 	}
 
 	// pay answered with an error, so it no longer runs, but parts it sent may
 	// still be in flight or have settled.
-	var pays struct {
-		Pays []struct {
-			Status string `json:"status"`
-		} `json:"pays"`
+	payment, lerr := c.listPays(ctx, map[string]any{"bolt11": bolt11})
+	switch {
+	case errors.Is(lerr, lightning.ErrPaymentNotFound) || lerr == nil && payment.Status == lightning.PaymentFailed:
+		return lightning.Payment{}, fmt.Errorf("%w: %w", lightning.ErrPaymentFailed, err)
+	case lerr != nil:
+		return lightning.Payment{}, fmt.Errorf("%w; %w", err, lerr)
+	case payment.Status == lightning.PaymentPending:
+		return lightning.Payment{}, fmt.Errorf("%w; payment still pending", err)
 	}
-	if lerr := c.call(ctx, "listpays", map[string]any{"bolt11": bolt11}, &pays); lerr != nil {
-		return fmt.Errorf("%w; %w", err, lerr)
+	return payment, nil
+}
+
+// LookupPayment returns the outgoing payment for paymentHash, or
+// lightning.ErrPaymentNotFound.
+func (c *Client) LookupPayment(ctx context.Context, paymentHash []byte) (lightning.Payment, error) {
+	return c.listPays(ctx, map[string]any{"payment_hash": hex.EncodeToString(paymentHash)})
+}
+
+// pay is a payment as pay and listpays report it.
+type pay struct {
+	Status          string `json:"status"`
+	PaymentPreimage string `json:"payment_preimage"`
+	Preimage        string `json:"preimage"`
+	AmountMsat      int64  `json:"amount_msat"`
+	AmountSentMsat  int64  `json:"amount_sent_msat"`
+}
+
+func (p pay) payment() (lightning.Payment, error) {
+	preimage, err := hex.DecodeString(p.PaymentPreimage + p.Preimage)
+	if err != nil || len(preimage) != 32 {
+		return lightning.Payment{}, fmt.Errorf("pay: invalid payment preimage")
 	}
-	for _, p := range pays.Pays {
+	return lightning.Payment{Status: lightning.PaymentSucceeded, Preimage: preimage, FeeMsat: p.AmountSentMsat - p.AmountMsat}, nil
+}
+
+// listPays returns the outcome of the attempts listpays reports for filter.
+func (c *Client) listPays(ctx context.Context, filter map[string]any) (lightning.Payment, error) {
+	var resp struct {
+		Pays []pay `json:"pays"`
+	}
+	if err := c.call(ctx, "listpays", filter, &resp); err != nil {
+		return lightning.Payment{}, err
+	}
+	if len(resp.Pays) == 0 {
+		return lightning.Payment{}, lightning.ErrPaymentNotFound
+	}
+	pending := false
+	for _, p := range resp.Pays {
 		switch p.Status {
 		case "complete":
-			return nil
+			return p.payment()
 		case "pending":
-			return fmt.Errorf("%w; payment still pending", err)
+			pending = true
 		}
 	}
-	return fmt.Errorf("%w: %w", lightning.ErrPaymentFailed, err)
+	if pending {
+		return lightning.Payment{Status: lightning.PaymentPending}, nil
+	}
+	return lightning.Payment{Status: lightning.PaymentFailed}, nil
 }
 
 // Network returns the parameters of the chain Core Lightning runs on.

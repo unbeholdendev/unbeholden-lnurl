@@ -506,12 +506,62 @@ notifications:
 		{"fragment", "ledger.example", "ledger.example#frag"},
 		{"unsafe name", "billing-1:", "../billing:"},
 		{"empty events", "[payment.received]", "[]"},
-		{"unknown event", "[payment.received]", "[payment.failed]"},
+		{"unknown event", "[payment.received]", "[payment.refunded]"},
 		{"missing state", "state_dir: /state", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := Load(writeTestConfig(t, strings.Replace(input, tc.from, tc.to, 1))); err == nil {
 				t.Fatal("expected invalid webhook configuration to fail")
+			}
+		})
+	}
+}
+
+func TestLoadPayments(t *testing.T) {
+	fileToken := strings.Repeat("f", 32)
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte(fileToken+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	input := lndYAML + `
+listen: "127.0.0.1:8080"
+state_dir: /state
+payments:
+  clients:
+    shop:
+      token: ` + strings.Repeat("i", 32) + `
+      allowed_ips: ["100.64.0.0/10"]
+      max_payment: 100000
+      daily_budget: 1000000
+      max_fee: 5000
+    office:
+      token_file: ` + path
+	cfg, err := Load(writeTestConfig(t, input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ServesHTTP() {
+		t.Fatal("payments need the HTTP listener")
+	}
+	shop, office := cfg.Payments.Clients["shop"], cfg.Payments.Clients["office"]
+	if shop.MaxPayment != 100000 || shop.DailyBudget != 1000000 || shop.MaxFee != 5000 || len(shop.AllowedIPs) != 1 || office.Token != fileToken {
+		t.Fatalf("clients = %+v", cfg.Payments.Clients)
+	}
+
+	for _, tc := range []struct{ name, from, to string }{
+		{"short token", strings.Repeat("i", 32), "short"},
+		{"shared token", strings.Repeat("i", 32), fileToken},
+		{"both tokens", "token_file: ", "token: " + strings.Repeat("o", 32) + "\n      token_file: "},
+		{"missing file", path, path + ".missing"},
+		{"unsafe name", "shop:", "../shop:"},
+		{"negative limit", "max_fee: 5000", "max_fee: -1"},
+		{"bad address", "100.64.0.0/10", "tailnet"},
+		{"missing state", "state_dir: /state", ""},
+		{"missing listen", `listen: "127.0.0.1:8080"`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Load(writeTestConfig(t, strings.Replace(input, tc.from, tc.to, 1))); err == nil {
+				t.Fatal("expected invalid payments configuration to fail")
 			}
 		})
 	}

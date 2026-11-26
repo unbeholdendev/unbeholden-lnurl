@@ -10,13 +10,15 @@ import (
 
 	"unbeholden-lnurl/internal/config"
 	"unbeholden-lnurl/internal/lnurl"
+	"unbeholden-lnurl/internal/payments"
 )
 
 const withdrawPath = "/lnurl/withdraw/"
 
-// New returns an HTTP server for the given handlers, either of which may be
-// nil. It honours forwarding headers only on requests from trustedProxies.
-func New(trustedProxies []config.Prefix, rateLimit config.RateLimit, withdraw *lnurl.WithdrawHandler, address *lnurl.AddressHandler) *http.Server {
+// New returns an HTTP server for the given handlers, any of which may be nil.
+// It honours forwarding headers only on requests from trustedProxies.
+func New(trustedProxies []config.Prefix, rateLimit config.RateLimit, withdraw *lnurl.WithdrawHandler, address *lnurl.AddressHandler, pay *payments.Handler) *http.Server {
+	p := proxies(trustedProxies)
 	mux := http.NewServeMux()
 	if withdraw != nil {
 		mux.HandleFunc("GET "+withdrawPath+"{token}", withdraw.HandleFirst)
@@ -27,17 +29,21 @@ func New(trustedProxies []config.Prefix, rateLimit config.RateLimit, withdraw *l
 		mux.HandleFunc("GET /.well-known/lnurlp/{username}/invoice", address.HandleInvoice)
 		mux.HandleFunc("GET /.well-known/lnurlp/{username}/verify/{token}", address.HandleVerify)
 	}
+	if pay != nil {
+		pay.Register(mux, p.clientIP)
+	}
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
 
-	p := proxies(trustedProxies)
 	var handler http.Handler = requestLogging(slog.Default(), p.clientIP, mux)
 	handler = newRateLimiter(float64(rateLimit.PerMinute)/60, rateLimit.Burst).middleware(p.clientIP, handler)
 	handler = p.forwardedHost(handler)
 	return &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
+			if r.URL.Path != "/payments" && !strings.HasPrefix(r.URL.Path, "/payments/") {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			}
 			handler.ServeHTTP(w, r)
 		}),
 		ReadHeaderTimeout: 5 * time.Second,

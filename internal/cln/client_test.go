@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -109,10 +110,11 @@ func TestConnect_VerifiesAgainstCAWhateverTheHostName(t *testing.T) {
 
 func TestSendPayment_Outcomes(t *testing.T) {
 	noRoute := rpcFail(205, "could not find a usable set of paths")
+	preimage := strings.Repeat("ab", 32)
 	pays := func(statuses ...string) reply {
 		var p []map[string]string
 		for _, s := range statuses {
-			p = append(p, map[string]string{"status": s})
+			p = append(p, map[string]string{"status": s, "preimage": preimage})
 		}
 		return ok(map[string]any{"pays": p})
 	}
@@ -121,7 +123,7 @@ func TestSendPayment_Outcomes(t *testing.T) {
 		wantErr    bool
 		wantFailed bool
 	}{
-		"complete":              {replies: map[string][]reply{"pay": {ok(map[string]string{"status": "complete"})}}},
+		"complete":              {replies: map[string][]reply{"pay": {ok(map[string]any{"status": "complete", "payment_preimage": preimage, "amount_msat": 1000, "amount_sent_msat": 1007})}}},
 		"pending":               {replies: map[string][]reply{"pay": {ok(map[string]string{"status": "pending"})}}, wantErr: true},
 		"failed, nothing sent":  {replies: map[string][]reply{"pay": {noRoute}, "listpays": {pays()}}, wantErr: true, wantFailed: true},
 		"failed, parts failed":  {replies: map[string][]reply{"pay": {noRoute}, "listpays": {pays("failed", "failed")}}, wantErr: true, wantFailed: true},
@@ -133,12 +135,44 @@ func TestSendPayment_Outcomes(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			f, c := newFakeNode(t, tc.replies)
-			err := c.SendPayment(context.Background(), "lnbc1", 10)
+			payment, err := c.SendPayment(context.Background(), "lnbc1", 10000)
 			if (err != nil) != tc.wantErr || errors.Is(err, lightning.ErrPaymentFailed) != tc.wantFailed {
 				t.Fatalf("err = %v, want error %v, definite failure %v", err, tc.wantErr, tc.wantFailed)
 			}
+			if err == nil && (payment.Status != lightning.PaymentSucceeded || hex.EncodeToString(payment.Preimage) != preimage) {
+				t.Fatalf("payment = %+v", payment)
+			}
 			if got := f.calls[0]["maxfee"]; got != float64(10000) {
 				t.Errorf("maxfee = %v, want 10000 msat", got)
+			}
+		})
+	}
+}
+
+func TestLookupPayment(t *testing.T) {
+	preimage := strings.Repeat("cd", 32)
+	cases := map[string]struct {
+		pays []map[string]any
+		want lightning.PaymentStatus
+		err  error
+	}{
+		"unknown":  {err: lightning.ErrPaymentNotFound},
+		"pending":  {pays: []map[string]any{{"status": "failed"}, {"status": "pending"}}, want: lightning.PaymentPending},
+		"failed":   {pays: []map[string]any{{"status": "failed"}}, want: lightning.PaymentFailed},
+		"complete": {pays: []map[string]any{{"status": "failed"}, {"status": "complete", "preimage": preimage, "amount_msat": 5000, "amount_sent_msat": 5012}}, want: lightning.PaymentSucceeded},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f, c := newFakeNode(t, map[string][]reply{"listpays": {ok(map[string]any{"pays": tc.pays})}})
+			payment, err := c.LookupPayment(context.Background(), []byte{0xab})
+			if !errors.Is(err, tc.err) || payment.Status != tc.want {
+				t.Fatalf("LookupPayment = %+v, %v; want %s, %v", payment, err, tc.want, tc.err)
+			}
+			if tc.want == lightning.PaymentSucceeded && (payment.FeeMsat != 12 || hex.EncodeToString(payment.Preimage) != preimage) {
+				t.Fatalf("payment = %+v", payment)
+			}
+			if f.calls[0]["payment_hash"] != "ab" {
+				t.Fatalf("listpays params = %v", f.calls[0])
 			}
 		})
 	}

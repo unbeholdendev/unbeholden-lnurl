@@ -16,8 +16,9 @@ import (
 	"github.com/btcsuite/btcd/chaincfg"
 )
 
-// Invoice contains the fields needed to validate a withdrawal.
+// Invoice contains the fields needed to validate and track a payment.
 type Invoice struct {
+	PaymentHash     [32]byte
 	DescriptionHash *[32]byte
 	Timestamp       time.Time
 	AmountMsat      *int64
@@ -120,10 +121,11 @@ func Decode(paymentRequest string, network *chaincfg.Params) (Invoice, error) {
 		switch tag {
 		case 1:
 			if length == 52 && !paymentHash {
-				_, err = bech32.ConvertBits(value, 5, 8, false)
+				decoded, err := bech32.ConvertBits(value, 5, 8, false)
 				if err != nil {
 					return invoice, err
 				}
+				invoice.PaymentHash = [32]byte(decoded)
 				paymentHash = true
 			}
 		case 13:

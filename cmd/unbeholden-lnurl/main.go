@@ -27,6 +27,7 @@ import (
 	"unbeholden-lnurl/internal/lnurl"
 	"unbeholden-lnurl/internal/nostr"
 	"unbeholden-lnurl/internal/notifier"
+	"unbeholden-lnurl/internal/payments"
 	"unbeholden-lnurl/internal/server"
 	"unbeholden-lnurl/internal/webhook"
 	"unbeholden-lnurl/internal/zap"
@@ -122,7 +123,7 @@ func checkHealth(listen string) error {
 // node is a Lightning node backend.
 type node interface {
 	lnurl.Invoicer
-	lnurl.Payer
+	payments.Node
 	notifier.Invoices
 	Network(ctx context.Context) (*chaincfg.Params, error)
 	Close() error
@@ -171,8 +172,11 @@ func run(ctx context.Context, cfg *config.Config) error {
 			}
 		}
 	}
+	// Kept apart from notify: a nil *notifications in an interface is not a nil Notifier.
+	var payNotify payments.Notifier
 	if len(endpoints) > 0 {
-		notify = &notifications{ntfy: ntfy, queue: queue, endpoints: endpoints}
+		hooks := &notifications{ntfy: ntfy, queue: queue, endpoints: endpoints}
+		notify, payNotify = hooks, hooks
 	}
 
 	var zapper *zap.Zapper
@@ -210,7 +214,7 @@ func run(ctx context.Context, cfg *config.Config) error {
 	}
 	g, ctx := errgroup.WithContext(ctx)
 	if cfg.ServesHTTP() {
-		srv, err := newServer(ctx, cfg, node, notify, zapper)
+		srv, err := newServer(ctx, cfg, node, notify, payNotify, zapper)
 		if err != nil {
 			return err
 		}
@@ -250,13 +254,18 @@ func run(ctx context.Context, cfg *config.Config) error {
 	return g.Wait()
 }
 
-func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.Notifier, zapper *zap.Zapper) (*http.Server, error) {
-	var withdrawHandler *lnurl.WithdrawHandler
-	if len(cfg.Withdraw) > 0 {
-		network, err := node.Network(ctx)
+func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.Notifier, payNotify payments.Notifier, zapper *zap.Zapper) (*http.Server, error) {
+	var network *chaincfg.Params
+	if len(cfg.Withdraw) > 0 || len(cfg.Payments.Clients) > 0 {
+		var err error
+		network, err = node.Network(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("get node network: %w", err)
 		}
+	}
+	var withdrawHandler *lnurl.WithdrawHandler
+	if len(cfg.Withdraw) > 0 {
+		var err error
 		withdrawHandler, err = lnurl.NewWithdrawHandler(
 			cfg.ExpandVouchers(),
 			cfg.WithdrawK1Key(),
@@ -284,7 +293,16 @@ func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.
 		}
 		addressHandler = lnurl.NewAddressHandler(cfg.Addresses, node, notify, verifyKey, zaps)
 	}
-	return server.New(cfg.TrustedProxies, cfg.RateLimit, withdrawHandler, addressHandler), nil
+	var paymentsHandler *payments.Handler
+	if clients := cfg.Payments.Clients; len(clients) > 0 {
+		var err error
+		paymentsHandler, err = payments.New(ctx, clients, node, lnurl.NewResolver(cfg.ProxyURL, network), payNotify, network, filepath.Join(cfg.StateDir, "payments.json"))
+		if err != nil {
+			return nil, err
+		}
+		slog.Info("payments enabled", "clients", len(clients))
+	}
+	return server.New(cfg.TrustedProxies, cfg.RateLimit, withdrawHandler, addressHandler, paymentsHandler), nil
 }
 
 // serve serves srv on ln until ctx is done, then shuts it down, waiting for

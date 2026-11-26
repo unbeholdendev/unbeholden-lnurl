@@ -1,5 +1,5 @@
-# Each feature runs when its section is present: addresses and withdraw need
-# listen; notifications, withdraw and nostr need state_dir.
+# Each feature runs when its section is present: addresses, withdraw and
+# payments need listen; notifications, withdraw, nostr and payments need state_dir.
 listen: "0.0.0.0:8080"
 state_dir: "/app/data"
 
@@ -48,7 +48,7 @@ notifications:
   #     secret_file: "/run/secrets/accounting-webhook"
   #   alerts:
   #     url: "https://alerts.example.com/hooks/vouchers"
-  #     events: [voucher.claimed, voucher.payout_failed, voucher.payout_unknown]
+  #     events: [voucher.claimed, voucher.payout_failed, voucher.payout_unknown, payment.sent, payment.failed]
   #     secret_file: "/run/secrets/alerts-webhook"
 
 # Required with withdraw vouchers. Generate the file with: openssl rand -hex 32
@@ -72,6 +72,18 @@ withdraw:
     description: "Restaurant tip"
     amount: 500000
     count: 20
+
+# Lets your own applications pay from the node. Each sends its token as
+# Authorization: Bearer. Generate one with: openssl rand -hex 32
+# Limits are in msat and optional; max_fee defaults to 1%, at least 10 sat.
+# payments:
+#   clients:
+#     shop:
+#       token_file: "/run/secrets/shop-payments"
+#       allowed_ips: ["100.64.0.0/10"]
+#       max_payment: 1000000
+#       daily_budget: 10000000
+#       max_fee: 10000
 
 # Zaps (NIP-57) for every address. The file holds a key of its own, as hex or
 # nsec: openssl rand -hex 32

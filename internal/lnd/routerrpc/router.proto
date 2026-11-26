@@ -5,6 +5,7 @@ import "lightning.proto";
 option go_package = "unbeholden-lnurl/internal/lnd/routerrpc";
 service Router {
 rpc SendPaymentV2 (SendPaymentRequest) returns (stream lnrpc.Payment);
+rpc TrackPaymentV2 (TrackPaymentRequest) returns (stream lnrpc.Payment);
 }
 
 message SendPaymentRequest {
@@ -33,4 +34,9 @@ message SendPaymentRequest {
     double time_pref = 23;
     bool cancelable = 24;
     map<uint64, bytes> first_hop_custom_records = 25;
+}
+
+message TrackPaymentRequest {
+    bytes payment_hash = 1;
+    bool no_inflight_updates = 2;
 }

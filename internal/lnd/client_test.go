@@ -1,6 +1,7 @@
 package lnd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -126,6 +127,13 @@ func (f *fakeRouter) SendPaymentV2(context.Context, *routerrpc.SendPaymentReques
 	return &fakePaymentStream{updates: f.updates, err: f.err}, nil
 }
 
+func (f *fakeRouter) TrackPaymentV2(_ context.Context, req *routerrpc.TrackPaymentRequest, _ ...grpc.CallOption) (routerrpc.Router_TrackPaymentV2Client, error) {
+	if req.NoInflightUpdates {
+		return nil, errors.New("no_inflight_updates waits for a final status")
+	}
+	return &fakePaymentStream{updates: f.updates, err: f.err}, nil
+}
+
 type fakePaymentStream struct {
 	grpc.ClientStream
 	updates []*lnrpc.Payment
@@ -148,15 +156,39 @@ func TestSendPayment_Outcomes(t *testing.T) {
 		wantErr    bool
 		wantFailed bool
 	}{
-		"succeeded":    {router: &fakeRouter{updates: []*lnrpc.Payment{inFlight, {Status: lnrpc.Payment_SUCCEEDED}}}},
+		"succeeded":    {router: &fakeRouter{updates: []*lnrpc.Payment{inFlight, {Status: lnrpc.Payment_SUCCEEDED, PaymentPreimage: "0102", FeeMsat: 7}}}},
 		"failed":       {router: &fakeRouter{updates: []*lnrpc.Payment{inFlight, {Status: lnrpc.Payment_FAILED}}}, wantErr: true, wantFailed: true},
 		"stream error": {router: &fakeRouter{updates: []*lnrpc.Payment{inFlight}, err: io.ErrUnexpectedEOF}, wantErr: true},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			err := (&Client{router: tc.router}).SendPayment(context.Background(), "lnbc", 10)
+			payment, err := (&Client{router: tc.router}).SendPayment(context.Background(), "lnbc", 10000)
 			if (err != nil) != tc.wantErr || errors.Is(err, lightning.ErrPaymentFailed) != tc.wantFailed {
 				t.Fatalf("err = %v, want error %v, definite failure %v", err, tc.wantErr, tc.wantFailed)
+			}
+			if err == nil && (payment.Status != lightning.PaymentSucceeded || !bytes.Equal(payment.Preimage, []byte{1, 2}) || payment.FeeMsat != 7) {
+				t.Fatalf("payment = %+v", payment)
+			}
+		})
+	}
+}
+
+func TestLookupPayment(t *testing.T) {
+	cases := map[string]struct {
+		router *fakeRouter
+		want   lightning.PaymentStatus
+		err    error
+	}{
+		"in flight": {router: &fakeRouter{updates: []*lnrpc.Payment{{Status: lnrpc.Payment_IN_FLIGHT}}}, want: lightning.PaymentPending},
+		"succeeded": {router: &fakeRouter{updates: []*lnrpc.Payment{{Status: lnrpc.Payment_SUCCEEDED, PaymentPreimage: "0102"}}}, want: lightning.PaymentSucceeded},
+		"failed":    {router: &fakeRouter{updates: []*lnrpc.Payment{{Status: lnrpc.Payment_FAILED}}}, want: lightning.PaymentFailed},
+		"unknown":   {router: &fakeRouter{err: status.Error(codes.NotFound, "payment isn't initiated")}, err: lightning.ErrPaymentNotFound},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			payment, err := (&Client{router: tc.router}).LookupPayment(context.Background(), []byte("hash"))
+			if !errors.Is(err, tc.err) || payment.Status != tc.want {
+				t.Fatalf("LookupPayment = %+v, %v; want %s, %v", payment, err, tc.want, tc.err)
 			}
 		})
 	}
