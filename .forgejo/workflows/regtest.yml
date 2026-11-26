@@ -9,15 +9,6 @@ on:
       - integration/**
       - '!**/*.md'
       - .forgejo/workflows/regtest.yml
-  push:
-    branches: [main]
-    paths:
-      - '**/*.go'
-      - go.mod
-      - go.sum
-      - integration/**
-      - '!**/*.md'
-      - .forgejo/workflows/regtest.yml
 
 jobs:
   regtest:
