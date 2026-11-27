@@ -145,7 +145,7 @@ func TestHandleInvoice(t *testing.T) {
 	if want := "https://shop.example.com/.well-known/lnurlp/bob/verify/" + node.lastHash(); !strings.HasPrefix(resp["verify"].(string), want) {
 		t.Fatalf("verify = %v, want %s", resp["verify"], want)
 	}
-	if len(node.notified) != 1 || node.notified[0] != "invoice 1500 "+node.lastHash()+" bob@shop.example.com hi" {
+	if len(node.notified) != 1 || node.notified[0] != "invoice 1500 "+node.lastHash()+" bob@shop.example.com hi  " {
 		t.Fatalf("notified = %v", node.notified)
 	}
 	if resp := get("amount=999"); resp["status"] != "ERROR" {
@@ -320,6 +320,10 @@ func TestZaps(t *testing.T) {
 	if node.description != raw {
 		t.Fatalf("invoice description = %q, want the zap request", node.description)
 	}
+	payer := url.QueryEscape(`{"name":"Alice"}`)
+	if get(h, invoice, "amount=1500&payerdata="+payer+"&nostr="+url.QueryEscape(raw)); node.description != raw || node.memo != long[:maxCommentLen] {
+		t.Fatalf("zap with payerdata: description = %q, memo = %q, want payerdata ignored", node.description, node.memo)
+	}
 	if node.memo != long[:maxCommentLen] {
 		t.Fatalf("memo = %q, want the content cut to %d bytes", node.memo, maxCommentLen)
 	}
@@ -364,4 +368,86 @@ func TestOnionCallbacks(t *testing.T) {
 			t.Fatalf("%s = %v", field, resp[field])
 		}
 	}
+}
+
+func TestPayerData(t *testing.T) {
+	node := &fakeNode{}
+	h := NewAddressHandler(map[string]config.AddressEntry{
+		"*": {Description: "any", MinSendable: 1000, MaxSendable: 2000},
+	}, node, node, testVerifyKey, nil)
+
+	get := func(handler http.HandlerFunc, query string) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest("GET", "https://shop.example.com/.well-known/lnurlp/bob?"+query, nil)
+		req.SetPathValue("username", "bob")
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	want := map[string]any{"name": map[string]any{"mandatory": false}, "identifier": map[string]any{"mandatory": false}}
+	if got, _ := json.Marshal(get(h.HandleWellKnown, "")["payerData"]); string(got) != mustJSON(t, want) {
+		t.Fatalf("payerData = %s", got)
+	}
+
+	raw := `{"name":"Alice","identifier":"alice@example.com"}`
+	if resp := get(h.HandleInvoice, "amount=1500&comment=hi&payerdata="+url.QueryEscape(raw)); resp["pr"] == nil {
+		t.Fatalf("invoice: %v", resp)
+	}
+	metadata := addressMetadata(config.AddressEntry{Description: "any"}, "bob", "shop.example.com")
+	if node.description != metadata+raw {
+		t.Fatalf("description = %q, want metadata followed by payerdata", node.description)
+	}
+	if want := "hi — Alice (alice@example.com)"; node.memo != want {
+		t.Fatalf("memo = %q, want %q", node.memo, want)
+	}
+	if want := "invoice 1500 " + node.lastHash() + " bob@shop.example.com hi Alice alice@example.com"; node.notified[len(node.notified)-1] != want {
+		t.Fatalf("notified = %q, want %q", node.notified[len(node.notified)-1], want)
+	}
+
+	for name, data := range map[string]string{
+		"not JSON":        `Alice`,
+		"trailing data":   `{"name":"Alice"}{}`,
+		"unrequested key": `{"email":"a@example.com"}`,
+		"name not string": `{"name":1}`,
+		"long name":       `{"name":"` + strings.Repeat("é", maxPayerNameLen+1) + `"}`,
+		"no at":           `{"identifier":"alice"}`,
+		"two ats":         `{"identifier":"a@b@example.com"}`,
+		"empty user":      `{"identifier":"@example.com"}`,
+		"space":           `{"identifier":"a b@example.com"}`,
+		"long identifier": `{"identifier":"` + strings.Repeat("a", maxPayerIdentifierLen) + `@x"}`,
+	} {
+		if resp := get(h.HandleInvoice, "amount=1500&payerdata="+url.QueryEscape(data)); resp["status"] != "ERROR" {
+			t.Errorf("%s: %v", name, resp)
+		}
+	}
+}
+
+func TestMemo(t *testing.T) {
+	for _, c := range []struct {
+		comment, name, identifier, want string
+	}{
+		{"", "", "", ""},
+		{"hi", "", "", "hi"},
+		{"hi", "Alice", "", "hi — Alice"},
+		{"hi", "", "alice@example.com", "hi — alice@example.com"},
+		{"", "Alice", "alice@example.com", "Alice (alice@example.com)"},
+	} {
+		if got := Memo(c.comment, PayerData{Name: c.name, Identifier: c.identifier}); got != c.want {
+			t.Errorf("Memo(%q, %q, %q) = %q, want %q", c.comment, c.name, c.identifier, got, c.want)
+		}
+	}
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }

@@ -9,6 +9,7 @@ import (
 
 	"unbeholden-lnurl/internal/config"
 	"unbeholden-lnurl/internal/lightning"
+	"unbeholden-lnurl/internal/lnurl"
 	"unbeholden-lnurl/internal/notifier"
 	"unbeholden-lnurl/internal/payments"
 	"unbeholden-lnurl/internal/webhook"
@@ -30,14 +31,17 @@ func (n *notifications) enqueue(event webhook.Event) {
 	}
 }
 
-func (n *notifications) NotifyInvoiceCreated(amountMsat int64, hash []byte, address, comment string) {
+func (n *notifications) NotifyInvoiceCreated(amountMsat int64, hash []byte, address, comment string, payer lnurl.PayerData) {
 	paymentHash := hex.EncodeToString(hash)
 	n.enqueue(webhook.Event{
 		ID: "created_" + paymentHash, Type: "invoice.created", OccurredAt: time.Now().UTC(),
-		Data: map[string]any{"amount_msat": amountMsat, "payment_hash": paymentHash, "address": address, "comment": comment},
+		Data: map[string]any{
+			"amount_msat": amountMsat, "payment_hash": paymentHash, "address": address, "comment": comment,
+			"payer_name": payer.Name, "payer_identifier": payer.Identifier,
+		},
 	})
 	if n.ntfy != nil {
-		n.ntfy.NotifyInvoiceCreated(amountMsat, hash, address, comment)
+		n.ntfy.NotifyInvoiceCreated(amountMsat, hash, address, lnurl.Memo(comment, payer))
 	}
 }
 

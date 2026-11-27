@@ -105,10 +105,10 @@ func (f *fakeNode) settle(hash string, preimage []byte) {
 	f.invoices[hash] = invoice
 }
 
-func (f *fakeNode) NotifyInvoiceCreated(amountMsat int64, hash []byte, address, comment string) {
+func (f *fakeNode) NotifyInvoiceCreated(amountMsat int64, hash []byte, address, comment string, payer PayerData) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.notified = append(f.notified, fmt.Sprintf("invoice %d %x %s %s", amountMsat, hash, address, comment))
+	f.notified = append(f.notified, fmt.Sprintf("invoice %d %x %s %s %s %s", amountMsat, hash, address, comment, payer.Name, payer.Identifier))
 }
 
 var testVoucher = config.Voucher{ID: "tip-001", Token: "abc123", Domain: "example.com", Description: "tip", Amount: 1_000_000}

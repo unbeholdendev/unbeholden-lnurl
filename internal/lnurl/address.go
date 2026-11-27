@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"unbeholden-lnurl/internal/config"
@@ -20,7 +22,11 @@ import (
 	"unbeholden-lnurl/internal/nostr"
 )
 
-const maxCommentLen = 140
+const (
+	maxCommentLen         = 140
+	maxPayerNameLen       = 64
+	maxPayerIdentifierLen = 320
+)
 
 // Invoicer creates and looks up invoices.
 type Invoicer interface {
@@ -48,14 +54,30 @@ type AddressHandler struct {
 }
 
 type payRequest struct {
-	Tag            string `json:"tag"`
-	Callback       string `json:"callback"`
-	Metadata       string `json:"metadata"`
-	MinSendable    int64  `json:"minSendable"`
-	MaxSendable    int64  `json:"maxSendable"`
-	CommentAllowed int    `json:"commentAllowed"`
-	AllowsNostr    bool   `json:"allowsNostr,omitempty"`
-	NostrPubkey    string `json:"nostrPubkey,omitempty"`
+	Tag            string          `json:"tag"`
+	Callback       string          `json:"callback"`
+	Metadata       string          `json:"metadata"`
+	MinSendable    int64           `json:"minSendable"`
+	MaxSendable    int64           `json:"maxSendable"`
+	CommentAllowed int             `json:"commentAllowed"`
+	AllowsNostr    bool            `json:"allowsNostr,omitempty"`
+	NostrPubkey    string          `json:"nostrPubkey,omitempty"`
+	PayerData      payerDataFields `json:"payerData"`
+}
+
+type payerField struct {
+	Mandatory bool `json:"mandatory"`
+}
+
+type payerDataFields struct {
+	Name       payerField `json:"name"`
+	Identifier payerField `json:"identifier"`
+}
+
+// PayerData is who the payer says they are (LUD-18). Nothing verifies it.
+type PayerData struct {
+	Name       string `json:"name"`
+	Identifier string `json:"identifier"`
 }
 
 type invoiceResponse struct {
@@ -150,6 +172,7 @@ func (h *AddressHandler) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 
 	// A zap's invoice commits to the zap request instead of the metadata.
 	description := addressMetadata(addr, username, r.Host)
+	var payer PayerData
 	zapRequest := r.URL.Query().Get("nostr")
 	if h.zapper == nil {
 		zapRequest = ""
@@ -162,9 +185,16 @@ func (h *AddressHandler) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 		}
 		description = zapRequest
 		comment = truncate(request.Content, maxCommentLen)
+	} else if raw := r.URL.Query().Get("payerdata"); raw != "" {
+		payer, err = parsePayer(raw)
+		if err != nil {
+			writeError(w, err.Error())
+			return
+		}
+		description += raw
 	}
 
-	invoice, err := h.invoicer.AddInvoice(r.Context(), amountMsat, description, comment)
+	invoice, err := h.invoicer.AddInvoice(r.Context(), amountMsat, description, Memo(comment, payer))
 	if err != nil {
 		slog.Error("add invoice failed", "username", username, "err", err)
 		writeError(w, "failed to create invoice")
@@ -180,7 +210,7 @@ func (h *AddressHandler) HandleInvoice(w http.ResponseWriter, r *http.Request) {
 
 	address := fmt.Sprintf("%s@%s", username, r.Host)
 	if h.ntfy != nil {
-		h.ntfy.NotifyInvoiceCreated(amountMsat, invoice.PaymentHash, address, comment)
+		h.ntfy.NotifyInvoiceCreated(amountMsat, invoice.PaymentHash, address, comment, payer)
 	}
 	slog.Info("invoice created", "sats", amountMsat/1000, "address", address)
 
@@ -233,6 +263,48 @@ func (h *AddressHandler) verifyToken(username string, paymentHash []byte) []byte
 	mac.Write(paymentHash)
 	mac.Write([]byte(username))
 	return mac.Sum(append([]byte{}, paymentHash...))[:sha256.Size+16]
+}
+
+// parsePayer reads LUD-18 payer data, which may hold only the fields
+// payRequest asks for.
+func parsePayer(raw string) (PayerData, error) {
+	var payer PayerData
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&payer); err != nil || dec.Decode(&struct{}{}) != io.EOF {
+		return PayerData{}, errors.New("invalid payerdata")
+	}
+	if utf8.RuneCountInString(payer.Name) > maxPayerNameLen {
+		return PayerData{}, fmt.Errorf("payer name too long (max %d characters)", maxPayerNameLen)
+	}
+	if payer.Identifier != "" {
+		user, host, ok := strings.Cut(payer.Identifier, "@")
+		if !ok || user == "" || host == "" || strings.Contains(host, "@") ||
+			strings.ContainsFunc(payer.Identifier, unicode.IsSpace) || len(payer.Identifier) > maxPayerIdentifierLen {
+			return PayerData{}, errors.New("payer identifier must be an address like user@example.com")
+		}
+	}
+	return payer, nil
+}
+
+// Memo is the text kept on the node for an invoice: the comment, then who
+// the payer says they are.
+func Memo(comment string, payer PayerData) string {
+	who := payer.Name
+	if payer.Identifier != "" {
+		if who == "" {
+			who = payer.Identifier
+		} else {
+			who += " (" + payer.Identifier + ")"
+		}
+	}
+	switch {
+	case who == "":
+		return comment
+	case comment == "":
+		return who
+	}
+	return comment + " — " + who
 }
 
 // truncate cuts s to at most n bytes without splitting a character.

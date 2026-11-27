@@ -9,6 +9,7 @@ import (
 
 	"unbeholden-lnurl/internal/config"
 	"unbeholden-lnurl/internal/lightning"
+	"unbeholden-lnurl/internal/lnurl"
 	"unbeholden-lnurl/internal/payments"
 	"unbeholden-lnurl/internal/webhook"
 )
@@ -61,5 +62,31 @@ func TestNotifyPayment_VoucherPayout(t *testing.T) {
 	}
 	if _, hasClient := event.Data["client"]; event.Type != "payment.failed" || event.Data["voucher_id"] != "tip-001" || hasClient {
 		t.Fatalf("event = %+v", event)
+	}
+}
+
+func TestNotifyInvoiceCreated_Payer(t *testing.T) {
+	dir := t.TempDir()
+	endpoints := map[string]config.WebhookConfig{"shop": {URL: "https://shop.example", Events: []string{"invoice.created"}, Key: make([]byte, 32)}}
+	queue, err := webhook.Open(dir, endpoints, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := &notifications{queue: queue, endpoints: endpoints}
+	n.NotifyInvoiceCreated(1500, []byte{1}, "bob@example.com", "hi", lnurl.PayerData{Name: "Alice", Identifier: "alice@example.com"})
+	pending, err := filepath.Glob(filepath.Join(dir, "active-*", "pending", "*.json"))
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("queued %d events, want 1 (%v)", len(pending), err)
+	}
+	raw, err := os.ReadFile(pending[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var queued struct{ Body webhook.Event }
+	if err := json.Unmarshal(raw, &queued); err != nil {
+		t.Fatal(err)
+	}
+	if data := queued.Body.Data; data["comment"] != "hi" || data["payer_name"] != "Alice" || data["payer_identifier"] != "alice@example.com" {
+		t.Fatalf("data = %v", data)
 	}
 }

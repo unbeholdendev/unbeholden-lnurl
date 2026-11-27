@@ -22,8 +22,8 @@ A Lightning Address is a human-readable wrapper around LNURL-pay:
 ## Features
 
 - LNURL-pay / Lightning Address support (LUD-06, LUD-16), with comments (LUD-12), a
-  message after payment (LUD-09), a long description (LUD-20), an avatar, and payment
-  verification (LUD-21)
+  message after payment (LUD-09), a long description (LUD-20), an avatar, payment
+  verification (LUD-21), and an optional payer name and Lightning Address (LUD-18)
 - Nostr zaps (NIP-57): zap receipts are published to the payer's relays once paid
 - Notifications for every invoice settled on the node, via ntfy or signed webhooks, including ones settled
   while the service was down
@@ -101,13 +101,18 @@ printf 'whsec_%s\n' "$(openssl rand -base64 32)"
 
 | Event | When it fires | Fields in `data` |
 | --- | --- | --- |
-| `invoice.created` | This service creates an address invoice | `amount_msat`, `payment_hash`, `address`, `comment` |
+| `invoice.created` | This service creates an address invoice | `amount_msat`, `payment_hash`, `address`, `comment`, `payer_name`, `payer_identifier` |
 | `payment.received` | Any invoice on the node settles | `amount_msat`, `payment_hash` |
 | `payment.sent` | A payments API payment or voucher payout succeeds | `amount_msat`, `fee_msat`, `payment_hash`, `destination`, and `client` and `id` or `voucher_id` |
 | `payment.failed` | The node confirms a payments API payment or voucher payout failed | as `payment.sent` |
 
 A voucher payout whose outcome is unknown sends nothing until the node reports it, and
 the voucher stays claimed unless it fails.
+
+`payer_name` and `payer_identifier` are what the payer's wallet sent, and nothing
+checks them. They are empty when the wallet sent none. ntfy shows them after the
+comment. To get the comment or payer of a `payment.received` event, find the
+`invoice.created` event with the same `payment_hash`.
 
 Each JSON POST contains `id`, `type`, `occurred_at` (UTC) and `data`. Verify
 the signature before acting. Use the exact request body and the
@@ -307,7 +312,7 @@ For example, for addresses and notifications:
 lightning-cli createrune restrictions='[["method=invoice","method=listinvoices","method=waitanyinvoice"]]'
 ```
 
-Core Lightning stores no memo on an invoice, so the payer's comment is kept in the
+Core Lightning stores no memo on an invoice, so the payer's comment, name and address are kept in the
 invoice's label.
 
 Without `withdraw` or `payments`, the server cannot move funds: it asks your node for an invoice and hands

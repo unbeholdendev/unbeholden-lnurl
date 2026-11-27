@@ -10,7 +10,7 @@ import (
 
 // Notifier is told about created invoices.
 type Notifier interface {
-	NotifyInvoiceCreated(amountMsat int64, hash []byte, address, comment string)
+	NotifyInvoiceCreated(amountMsat int64, hash []byte, address, comment string, payer PayerData)
 }
 
 type status struct {
