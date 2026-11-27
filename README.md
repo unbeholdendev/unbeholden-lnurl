@@ -103,11 +103,11 @@ printf 'whsec_%s\n' "$(openssl rand -base64 32)"
 | --- | --- | --- |
 | `invoice.created` | This service creates an address invoice | `amount_msat`, `payment_hash`, `address`, `comment` |
 | `payment.received` | Any invoice on the node settles | `amount_msat`, `payment_hash` |
-| `voucher.claimed` | The voucher payout succeeds | `amount_msat`, `voucher_id` |
-| `voucher.payout_failed` | The node confirms the payout failed | `amount_msat`, `voucher_id` |
-| `voucher.payout_unknown` | The payout result is uncertain and the voucher stays claimed | `amount_msat`, `voucher_id` |
-| `payment.sent` | A payments API payment succeeds | `client`, `id`, `amount_msat`, `fee_msat`, `payment_hash`, `destination` |
-| `payment.failed` | The node confirms a payments API payment failed | `client`, `id`, `amount_msat`, `fee_msat`, `payment_hash`, `destination` |
+| `payment.sent` | A payments API payment or voucher payout succeeds | `amount_msat`, `fee_msat`, `payment_hash`, `destination`, and `client` and `id` or `voucher_id` |
+| `payment.failed` | The node confirms a payments API payment or voucher payout failed | as `payment.sent` |
+
+A voucher payout whose outcome is unknown sends nothing until the node reports it, and
+the voucher stays claimed unless it fails.
 
 Each JSON POST contains `id`, `type`, `occurred_at` (UTC) and `data`. Verify
 the signature before acting. Use the exact request body and the
@@ -227,7 +227,7 @@ The request waits up to 2 minutes and returns the payment:
 
 `status` is `pending`, `succeeded` or `failed`. While a payment is pending, `GET
 /payments/{id}` asks the node for its outcome; the server also checks pending payments at
-startup. `GET /payments?since=2026-11-01T00:00:00Z` lists the client's payments created
+startup and every minute. `GET /payments?since=2026-11-01T00:00:00Z` lists the client's payments created
 since that time, oldest first, under `payments`.
 
 Errors return `{"error": "..."}` with status 400 for an invalid request, 401 for a wrong
@@ -235,7 +235,8 @@ token, 403 for a disallowed address or an exceeded limit, 404 for an unknown `id
 for a reused `id` or an invoice already paid, and 502 when a Lightning Address cannot be
 resolved.
 
-The server keeps payments in `state_dir/payments.json` for 90 days after they complete.
+The server keeps payments in `state_dir/payments.json` for 90 days after they complete,
+and each voucher's latest payout for good.
 
 ### Zaps
 
@@ -285,7 +286,7 @@ Give the server a macaroon with only the permissions its enabled features need, 
 | --- | --- |
 | `addresses` | `invoices:read`, `invoices:write` |
 | `notifications`, `nostr` | `invoices:read` |
-| `withdraw` | `offchain:write`, `info:read` |
+| `withdraw` | `offchain:read`, `offchain:write`, `info:read` |
 | `payments` | `offchain:read`, `offchain:write`, `info:read` |
 
 LND's `invoice.macaroon` covers addresses and notifications. Bake others with

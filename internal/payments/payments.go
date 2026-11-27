@@ -1,5 +1,5 @@
 // Package payments lets configured clients pay invoices and Lightning
-// Addresses from the node.
+// Addresses from the node, and pays out withdraw vouchers.
 package payments
 
 import (
@@ -31,9 +31,10 @@ import (
 )
 
 const (
-	budgetWindow = 24 * time.Hour
-	retention    = 90 * 24 * time.Hour
-	maxBodyLen   = 64 << 10
+	budgetWindow   = 24 * time.Hour
+	reconcileEvery = time.Minute
+	retention      = 90 * 24 * time.Hour
+	maxBodyLen     = 64 << 10
 )
 
 var paymentID = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
@@ -53,7 +54,8 @@ type Resolver interface {
 	Invoice(ctx context.Context, address string, amountMsat int64, comment string) (string, error)
 }
 
-// Notifier is told when a client's payment succeeds or fails.
+// Notifier is told when a payment succeeds or fails. client is empty for a
+// voucher payout, whose payment ID is the voucher ID.
 type Notifier interface {
 	NotifyPayment(client string, payment Payment)
 }
@@ -116,6 +118,7 @@ type Handler struct {
 // New returns a Handler for clients that keeps payments in path and accepts
 // invoices for network. It settles payments left pending by an earlier run
 // where the node knows their outcome. A nil notify sends no notifications.
+// Voucher payouts are kept under the empty client name, which config rejects.
 func New(ctx context.Context, clients map[string]config.PaymentClient, node Node, resolver Resolver, notify Notifier, network *chaincfg.Params, path string) (*Handler, error) {
 	h := &Handler{
 		node:     node,
@@ -132,12 +135,36 @@ func New(ctx context.Context, clients map[string]config.PaymentClient, node Node
 	if err := h.load(); err != nil {
 		return nil, fmt.Errorf("load payments: %w", err)
 	}
-	for k, r := range h.records {
-		if r.Status == lightning.PaymentPending {
-			h.refresh(ctx, k)
+	h.reconcile(ctx)
+	return h, nil
+}
+
+// Run asks the node about pending payments every minute until ctx is done.
+func (h *Handler) Run(ctx context.Context) {
+	ticker := time.NewTicker(reconcileEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			h.reconcile(ctx)
 		}
 	}
-	return h, nil
+}
+
+func (h *Handler) reconcile(ctx context.Context) {
+	h.mu.Lock()
+	var pending []key
+	for k, r := range h.records {
+		if r.Status == lightning.PaymentPending {
+			pending = append(pending, k)
+		}
+	}
+	h.mu.Unlock()
+	for _, k := range pending {
+		h.refresh(ctx, k)
+	}
 }
 
 // Register adds the API's routes to mux. clientIP gives a request's client
@@ -278,32 +305,88 @@ func (h *Handler) handlePay(w http.ResponseWriter, r *http.Request, c client) {
 		Request:    string(fingerprint),
 		MaxFeeMsat: maxFee,
 	}
-	h.records[k] = rec
-	if err := h.saveLocked(); err != nil {
-		delete(h.records, k)
-		h.mu.Unlock()
-		slog.Error("payment not sent: failed to save it", "client", c.name, "id", req.ID, "err", err)
+	payment, err := h.sendLocked(r.Context(), k, rec, invoice)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to record payment")
 		return
+	}
+	writeJSON(w, http.StatusOK, payment)
+}
+
+// PayVoucher pays bolt11 for voucher id, which must not have a payout that
+// succeeded or may still succeed. An error means nothing was sent.
+func (h *Handler) PayVoucher(ctx context.Context, id, bolt11Invoice string, amountMsat int64) (lightning.PaymentStatus, error) {
+	decoded, err := bolt11.Decode(bolt11Invoice, h.network)
+	if err != nil {
+		return "", fmt.Errorf("invalid invoice: %w", err)
+	}
+	k := key{"", id}
+	h.mu.Lock()
+	if rec, ok := h.records[k]; ok && rec.Status != lightning.PaymentFailed {
+		h.mu.Unlock()
+		return "", errors.New("voucher already paid or being paid")
+	}
+	if err := h.duplicateLocked(decoded.PaymentHash[:]); err != nil {
+		h.mu.Unlock()
+		return "", err
+	}
+	maxFee := lightning.DefaultMaxFee(amountMsat)
+	payment, err := h.sendLocked(ctx, k, &record{
+		Payment: Payment{
+			ID:          id,
+			Status:      lightning.PaymentPending,
+			AmountMsat:  amountMsat,
+			PaymentHash: hex.EncodeToString(decoded.PaymentHash[:]),
+			Destination: bolt11Invoice,
+			CreatedAt:   time.Now().UTC(),
+		},
+		MaxFeeMsat: maxFee,
+	}, bolt11Invoice)
+	return payment.Status, err
+}
+
+// VoucherFailed reports whether a payout for voucher id started at or after
+// since and failed.
+func (h *Handler) VoucherFailed(id string, since time.Time) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	rec, ok := h.records[key{"", id}]
+	return ok && rec.Status == lightning.PaymentFailed && !rec.CreatedAt.Before(since)
+}
+
+// sendLocked saves pending rec as payment k, releases h.mu and pays invoice.
+// It returns an error, having sent nothing, if rec cannot be saved.
+func (h *Handler) sendLocked(ctx context.Context, k key, rec *record, invoice string) (Payment, error) {
+	previous, replaced := h.records[k]
+	h.records[k] = rec
+	if err := h.saveLocked(); err != nil {
+		if replaced {
+			h.records[k] = previous
+		} else {
+			delete(h.records, k)
+		}
+		h.mu.Unlock()
+		slog.Error("payment not sent: failed to save it", "client", k.client, "id", k.id, "err", err)
+		return Payment{}, err
 	}
 	h.inFlight[k] = true
 	h.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), lnurl.PayTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lnurl.PayTimeout)
 	defer cancel()
-	payment, err := h.node.SendPayment(ctx, invoice, maxFee)
+	payment, err := h.node.SendPayment(ctx, invoice, rec.MaxFeeMsat)
 	switch {
 	case errors.Is(err, lightning.ErrPaymentFailed):
-		slog.Warn("payment failed", "client", c.name, "id", req.ID, "err", err)
+		slog.Warn("payment failed", "client", k.client, "id", k.id, "err", err)
 		payment = lightning.Payment{Status: lightning.PaymentFailed}
 	case err != nil:
-		slog.Error("payment outcome unknown, left pending", "client", c.name, "id", req.ID, "err", err)
+		slog.Error("payment outcome unknown, left pending", "client", k.client, "id", k.id, "err", err)
 		payment = lightning.Payment{Status: lightning.PaymentPending}
 	}
 	h.mu.Lock()
 	delete(h.inFlight, k)
 	h.mu.Unlock()
-	writeJSON(w, http.StatusOK, h.complete(k, payment))
+	return h.complete(k, payment), nil
 }
 
 func (req payRequest) validate() error {
@@ -499,12 +582,14 @@ func (h *Handler) load() error {
 	return nil
 }
 
-// saveLocked writes every payment not completed before the retention period.
+// saveLocked writes every voucher payout and every payment not completed
+// before the retention period. Each voucher keeps only its latest payout,
+// which decides whether its claim stands.
 func (h *Handler) saveLocked() error {
 	cutoff := time.Now().Add(-retention)
 	state := stateFile{Payments: []*record{}}
 	for k, rec := range h.records {
-		if rec.CompletedAt != nil && rec.CompletedAt.Before(cutoff) {
+		if k.client != "" && rec.CompletedAt != nil && rec.CompletedAt.Before(cutoff) {
 			delete(h.records, k)
 			continue
 		}

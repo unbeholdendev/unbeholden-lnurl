@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -27,5 +28,38 @@ func TestNotifyPayment_DistinctEventIDs(t *testing.T) {
 	if err != nil || len(pending) != 2 {
 		entries, _ := os.ReadDir(dir)
 		t.Fatalf("queued %d events, want 2 (%v, %v)", len(pending), err, entries)
+	}
+}
+
+func TestNotifyPayment_VoucherPayout(t *testing.T) {
+	dir := t.TempDir()
+	endpoints := map[string]config.WebhookConfig{"alerts": {URL: "https://alerts.example", Events: []string{"payment.failed"}, Key: make([]byte, 32)}}
+	queue, err := webhook.Open(dir, endpoints, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := &notifications{queue: queue, endpoints: endpoints}
+	now := time.Now()
+	for _, created := range []time.Time{now.Add(-time.Minute), now} {
+		n.NotifyPayment("", payments.Payment{ID: "tip-001", Status: lightning.PaymentFailed, AmountMsat: 1000, PaymentHash: "aa", CreatedAt: created, CompletedAt: &now})
+	}
+	pending, err := filepath.Glob(filepath.Join(dir, "active-*", "pending", "*.json"))
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("queued %d events, want one per attempt (%v)", len(pending), err)
+	}
+	var item struct{ Body json.RawMessage }
+	data, _ := os.ReadFile(pending[0])
+	if err := json.Unmarshal(data, &item); err != nil {
+		t.Fatal(err)
+	}
+	var event struct {
+		Type string
+		Data map[string]any
+	}
+	if err := json.Unmarshal(item.Body, &event); err != nil {
+		t.Fatal(err)
+	}
+	if _, hasClient := event.Data["client"]; event.Type != "payment.failed" || event.Data["voucher_id"] != "tip-001" || hasClient {
+		t.Fatalf("event = %+v", event)
 	}
 }

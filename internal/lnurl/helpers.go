@@ -8,9 +8,8 @@ import (
 	"github.com/btcsuite/btcd/btcutil/bech32"
 )
 
-// Notifier is told about voucher payout outcomes and created invoices.
+// Notifier is told about created invoices.
 type Notifier interface {
-	NotifyVoucher(event, voucherID string, amountMsat int64)
 	NotifyInvoiceCreated(amountMsat int64, hash []byte, address, comment string)
 }
 

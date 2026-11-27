@@ -58,10 +58,7 @@ func (n *Ntfy) NotifyPayment(invoice lightning.Settled) error {
 }
 
 // NotifyVoucher sends a notification for a claimed withdraw voucher.
-func (n *Ntfy) NotifyVoucher(event, voucherID string, amountMsat int64) {
-	if event != "voucher.claimed" {
-		return
-	}
+func (n *Ntfy) NotifyVoucher(voucherID string, amountMsat int64) {
 	body := fmt.Sprintf("Voucher %s claimed (%d sats)", voucherID, amountMsat/1000)
 	n.sendOrLog("Voucher claimed", body)
 }

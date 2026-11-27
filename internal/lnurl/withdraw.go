@@ -28,12 +28,13 @@ const k1TTL = 5 * time.Minute
 // PayTimeout bounds how long a withdraw claim waits for its payment.
 const PayTimeout = 2 * time.Minute
 
-// Payer pays BOLT-11 invoices.
+// Payer pays out vouchers and tracks the payouts.
 type Payer interface {
-	// SendPayment pays bolt11, spending at most maxFeeMsat in fees. An error
-	// wrapping lightning.ErrPaymentFailed means the payment definitely failed;
-	// any other error leaves it unknown.
-	SendPayment(ctx context.Context, bolt11 string, maxFeeMsat int64) (lightning.Payment, error)
+	// PayVoucher pays bolt11 for voucher id. An error means nothing was sent.
+	PayVoucher(ctx context.Context, id, bolt11 string, amountMsat int64) (lightning.PaymentStatus, error)
+	// VoucherFailed reports whether a payout for voucher id started at or
+	// after since and failed.
+	VoucherFailed(id string, since time.Time) bool
 }
 
 // WithdrawHandler handles LNURL-withdraw protocol requests.
@@ -43,7 +44,6 @@ type WithdrawHandler struct {
 	k1Key     []byte
 	network   *chaincfg.Params
 	payer     Payer
-	ntfy      Notifier
 	statePath string
 
 	mu      sync.Mutex
@@ -71,16 +71,15 @@ type withdrawRequest struct {
 
 // NewWithdrawHandler creates a WithdrawHandler that signs k1 values with
 // k1Key, accepts invoices for network and records claims in statePath. It
-// fails if statePath exists but cannot be read. A nil ntfy sends no
-// notifications.
-func NewWithdrawHandler(vouchers []config.Voucher, k1Key []byte, network *chaincfg.Params, payer Payer, ntfy Notifier, statePath string) (*WithdrawHandler, error) {
+// fails if statePath exists but cannot be read. A nil payer only lists
+// vouchers.
+func NewWithdrawHandler(vouchers []config.Voucher, k1Key []byte, network *chaincfg.Params, payer Payer, statePath string) (*WithdrawHandler, error) {
 	h := &WithdrawHandler{
 		vouchers:  vouchers,
 		byToken:   make(map[string]config.Voucher, len(vouchers)),
 		k1Key:     k1Key,
 		network:   network,
 		payer:     payer,
-		ntfy:      ntfy,
 		statePath: statePath,
 		claimed:   make(map[string]ClaimedInfo),
 	}
@@ -103,7 +102,7 @@ func (h *WithdrawHandler) HandleFirst(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
-	_, claimed := h.claimed[voucher.ID]
+	claimed := h.claimedLocked(voucher.ID)
 	h.mu.Unlock()
 	if claimed {
 		writeError(w, "this voucher has already been claimed")
@@ -145,12 +144,13 @@ func (h *WithdrawHandler) HandleClaim(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
-	if _, claimed := h.claimed[voucher.ID]; claimed {
+	if h.claimedLocked(voucher.ID) {
 		h.mu.Unlock()
 		writeError(w, "this voucher has already been claimed")
 		return
 	}
-	h.claimed[voucher.ID] = ClaimedInfo{ClaimedAt: time.Now().UTC(), AmountMsat: voucher.Amount}
+	claimedAt := time.Now().UTC()
+	h.claimed[voucher.ID] = ClaimedInfo{ClaimedAt: claimedAt, AmountMsat: voucher.Amount}
 	err := h.saveStateLocked()
 	if err != nil {
 		delete(h.claimed, voucher.ID)
@@ -162,38 +162,49 @@ func (h *WithdrawHandler) HandleClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), PayTimeout)
-	defer cancel()
-	_, err = h.payer.SendPayment(ctx, pr, lightning.DefaultMaxFee(voucher.Amount))
-	switch {
-	case errors.Is(err, lightning.ErrPaymentFailed):
-		slog.Warn("withdraw payment failed", "voucher", voucher.ID, "err", err)
-		if err := h.release(voucher.ID); err != nil {
-			slog.Error("withdraw release not saved", "voucher", voucher.ID, "err", err)
+	payout, err := h.payer.PayVoucher(r.Context(), voucher.ID, pr, voucher.Amount)
+	if err != nil || payout == lightning.PaymentFailed {
+		if err != nil {
+			slog.Warn("withdraw not paid", "voucher", voucher.ID, "err", err)
 		}
-		if h.ntfy != nil {
-			h.ntfy.NotifyVoucher("voucher.payout_failed", voucher.ID, voucher.Amount)
+		if err := h.release(voucher.ID, claimedAt); err != nil {
+			slog.Error("withdraw release not saved", "voucher", voucher.ID, "err", err)
 		}
 		writeError(w, "payment failed")
 		return
-	case err != nil:
-		slog.Error("withdraw payment outcome unknown, voucher left claimed", "voucher", voucher.ID, "err", err)
-		if h.ntfy != nil {
-			h.ntfy.NotifyVoucher("voucher.payout_unknown", voucher.ID, voucher.Amount)
-		}
+	}
+	if payout == lightning.PaymentPending {
 		writeError(w, "payment outcome unknown")
 		return
-	}
-
-	if h.ntfy != nil {
-		h.ntfy.NotifyVoucher("voucher.claimed", voucher.ID, voucher.Amount)
 	}
 	writeJSON(w, status{Status: "OK"})
 }
 
-func (h *WithdrawHandler) release(id string) error {
+// claimedLocked reports whether voucher id is claimed, first releasing a claim
+// whose payout has since failed.
+func (h *WithdrawHandler) claimedLocked(id string) bool {
+	info, ok := h.claimed[id]
+	if !ok {
+		return false
+	}
+	if h.payer == nil || !h.payer.VoucherFailed(id, info.ClaimedAt) {
+		return true
+	}
+	delete(h.claimed, id)
+	if err := h.saveStateLocked(); err != nil {
+		slog.Error("withdraw release not saved", "voucher", id, "err", err)
+	}
+	return false
+}
+
+// release removes the claim on voucher id made at claimedAt, unless a newer
+// claim has replaced it.
+func (h *WithdrawHandler) release(id string, claimedAt time.Time) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if !h.claimed[id].ClaimedAt.Equal(claimedAt) {
+		return nil
+	}
 	delete(h.claimed, id)
 	return h.saveStateLocked()
 }
@@ -274,7 +285,7 @@ func (h *WithdrawHandler) UnclaimedVouchers() []VoucherStatus {
 
 	var result []VoucherStatus
 	for _, v := range h.vouchers {
-		if _, claimed := h.claimed[v.ID]; !claimed {
+		if !h.claimedLocked(v.ID) {
 			url := fmt.Sprintf("%s/lnurl/withdraw/%s", hostURL(v.Domain), v.Token)
 			lnurl, _ := LNURLEncode(url)
 			result = append(result, VoucherStatus{

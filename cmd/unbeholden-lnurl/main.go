@@ -80,7 +80,7 @@ func main() {
 		return
 	}
 	if *listVouchers {
-		handler, err := lnurl.NewWithdrawHandler(cfg.ExpandVouchers(), cfg.WithdrawK1Key(), nil, nil, nil, filepath.Join(cfg.StateDir, "state.json"))
+		handler, err := lnurl.NewWithdrawHandler(cfg.ExpandVouchers(), cfg.WithdrawK1Key(), nil, nil, filepath.Join(cfg.StateDir, "state.json"))
 		if err == nil {
 			err = json.NewEncoder(os.Stdout).Encode(handler.UnclaimedVouchers())
 		}
@@ -155,10 +155,8 @@ func run(ctx context.Context, cfg *config.Config) error {
 	defer node.Close()
 
 	var ntfy *notifier.Ntfy
-	var notify lnurl.Notifier
 	if n := cfg.Notifications.Ntfy; n != nil {
 		ntfy = notifier.NewNtfy(*n, cfg.ProxyURL)
-		notify = ntfy
 	}
 	var queue *webhook.Queue
 	endpoints := cfg.Notifications.Webhooks
@@ -172,9 +170,10 @@ func run(ctx context.Context, cfg *config.Config) error {
 			}
 		}
 	}
-	// Kept apart from notify: a nil *notifications in an interface is not a nil Notifier.
+	// Interfaces left nil without notifications: a nil *notifications in an interface is not nil.
+	var notify lnurl.Notifier
 	var payNotify payments.Notifier
-	if len(endpoints) > 0 {
+	if ntfy != nil || len(endpoints) > 0 {
 		hooks := &notifications{ntfy: ntfy, queue: queue, endpoints: endpoints}
 		notify, payNotify = hooks, hooks
 	}
@@ -214,9 +213,15 @@ func run(ctx context.Context, cfg *config.Config) error {
 	}
 	g, ctx := errgroup.WithContext(ctx)
 	if cfg.ServesHTTP() {
-		srv, err := newServer(ctx, cfg, node, notify, payNotify, zapper)
+		srv, paymentsHandler, err := newServer(ctx, cfg, node, notify, payNotify, zapper)
 		if err != nil {
 			return err
+		}
+		if paymentsHandler != nil {
+			g.Go(func() error {
+				paymentsHandler.Run(ctx)
+				return nil
+			})
 		}
 		ln, err := net.Listen("tcp", cfg.Listen)
 		if err != nil {
@@ -254,13 +259,21 @@ func run(ctx context.Context, cfg *config.Config) error {
 	return g.Wait()
 }
 
-func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.Notifier, payNotify payments.Notifier, zapper *zap.Zapper) (*http.Server, error) {
+// newServer returns the HTTP server and, when withdraw vouchers or payment
+// clients are configured, the payments handler whose Run must be started.
+func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.Notifier, payNotify payments.Notifier, zapper *zap.Zapper) (*http.Server, *payments.Handler, error) {
+	clients := cfg.Payments.Clients
 	var network *chaincfg.Params
-	if len(cfg.Withdraw) > 0 || len(cfg.Payments.Clients) > 0 {
+	var paymentsHandler *payments.Handler
+	if len(cfg.Withdraw) > 0 || len(clients) > 0 {
 		var err error
 		network, err = node.Network(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("get node network: %w", err)
+			return nil, nil, fmt.Errorf("get node network: %w", err)
+		}
+		paymentsHandler, err = payments.New(ctx, clients, node, lnurl.NewResolver(cfg.ProxyURL, network), payNotify, network, filepath.Join(cfg.StateDir, "payments.json"))
+		if err != nil {
+			return nil, nil, err
 		}
 	}
 	var withdrawHandler *lnurl.WithdrawHandler
@@ -270,12 +283,11 @@ func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.
 			cfg.ExpandVouchers(),
 			cfg.WithdrawK1Key(),
 			network,
-			node,
-			notify,
+			paymentsHandler,
 			filepath.Join(cfg.StateDir, "state.json"),
 		)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		unclaimed := withdrawHandler.UnclaimedVouchers()
 		slog.Info("withdraw vouchers", "unclaimed", len(unclaimed))
@@ -284,7 +296,7 @@ func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.
 	if len(cfg.Addresses) > 0 {
 		verifyKey, err := cfg.VerifyKey()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		// Kept apart from zapper: a nil *Zapper in an interface is not a nil Zapper.
 		var zaps lnurl.Zapper
@@ -293,16 +305,12 @@ func newServer(ctx context.Context, cfg *config.Config, node node, notify lnurl.
 		}
 		addressHandler = lnurl.NewAddressHandler(cfg.Addresses, node, notify, verifyKey, zaps)
 	}
-	var paymentsHandler *payments.Handler
-	if clients := cfg.Payments.Clients; len(clients) > 0 {
-		var err error
-		paymentsHandler, err = payments.New(ctx, clients, node, lnurl.NewResolver(cfg.ProxyURL, network), payNotify, network, filepath.Join(cfg.StateDir, "payments.json"))
-		if err != nil {
-			return nil, err
-		}
+	var api *payments.Handler
+	if len(clients) > 0 {
+		api = paymentsHandler
 		slog.Info("payments enabled", "clients", len(clients))
 	}
-	return server.New(cfg.TrustedProxies, cfg.RateLimit, withdrawHandler, addressHandler, paymentsHandler), nil
+	return server.New(cfg.TrustedProxies, cfg.RateLimit, withdrawHandler, addressHandler, api), paymentsHandler, nil
 }
 
 // serve serves srv on ln until ctx is done, then shuts it down, waiting for

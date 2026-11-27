@@ -35,11 +35,13 @@ type fakeNode struct {
 	lookups map[string]lightning.Payment
 	sent    []string
 	maxFees []int64
+	ctxErrs []error
 }
 
-func (f *fakeNode) SendPayment(_ context.Context, bolt11 string, maxFeeMsat int64) (lightning.Payment, error) {
+func (f *fakeNode) SendPayment(ctx context.Context, bolt11 string, maxFeeMsat int64) (lightning.Payment, error) {
 	f.mu.Lock()
 	f.sent = append(f.sent, bolt11)
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
 	f.maxFees = append(f.maxFees, maxFeeMsat)
 	send := f.send
 	f.mu.Unlock()
@@ -364,5 +366,87 @@ func TestPay_OldPendingPaymentStillReservesBudget(t *testing.T) {
 	h.restart()
 	if code, got := h.pay(shopToken, "next", invoice(1, 50000)); code != 403 {
 		t.Fatalf("budget ignored a pending payment older than a day: %d %v", code, got)
+	}
+}
+
+func TestPayVoucher_PaysOnceAndRetriesAfterFailure(t *testing.T) {
+	h := newHarness(t, nil)
+	h.node.send = func(string) (lightning.Payment, error) {
+		return lightning.Payment{}, fmt.Errorf("%w: no route", lightning.ErrPaymentFailed)
+	}
+	start := time.Now()
+	if status, err := h.handler.PayVoucher(context.Background(), "tip", invoice(1, 1000), 1000); err != nil || status != lightning.PaymentFailed {
+		t.Fatalf("failed payout: %v %v", status, err)
+	}
+	if !h.handler.VoucherFailed("tip", start) || h.handler.VoucherFailed("tip", time.Now()) {
+		t.Fatal("VoucherFailed ignores when the payout started")
+	}
+	h.node.send = nil
+	if status, err := h.handler.PayVoucher(context.Background(), "tip", invoice(1, 1000), 1000); err != nil || status != lightning.PaymentSucceeded {
+		t.Fatalf("retried payout: %v %v", status, err)
+	}
+	if _, err := h.handler.PayVoucher(context.Background(), "tip", invoice(2, 1000), 1000); err == nil {
+		t.Fatal("paid a voucher twice")
+	}
+	if _, err := h.handler.PayVoucher(context.Background(), "other", invoice(1, 1000), 1000); err == nil {
+		t.Fatal("paid an invoice twice")
+	}
+	if len(h.node.sent) != 2 || h.node.maxFees[0] != 10000 {
+		t.Fatalf("sent %d payments, max fees %v", len(h.node.sent), h.node.maxFees)
+	}
+	want := []notified{{"", lightning.PaymentFailed}, {"", lightning.PaymentSucceeded}}
+	if fmt.Sprint(h.notifier.events) != fmt.Sprint(want) {
+		t.Fatalf("notified %v, want %v", h.notifier.events, want)
+	}
+	if _, got := h.do("GET", "/payments", shopToken, ""); len(got["payments"].([]any)) != 0 {
+		t.Fatalf("client sees voucher payouts: %v", got)
+	}
+}
+
+func TestPayVoucher_KeptPastRetention(t *testing.T) {
+	h := newHarness(t, nil)
+	old := time.Now().AddDate(0, 0, -100).UTC()
+	state := stateFile{Payments: []*record{
+		{Payment: Payment{ID: "tip", Status: lightning.PaymentFailed, PaymentHash: hash(1), CreatedAt: old, CompletedAt: &old}},
+	}}
+	data, _ := json.Marshal(state)
+	if err := os.WriteFile(h.path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	h.restart()
+	h.pay(shopToken, "a", invoice(2, 1000))
+	h.restart()
+	if !h.handler.VoucherFailed("tip", old) {
+		t.Fatal("pruned the failure that releases a voucher")
+	}
+}
+
+func TestPayVoucher_OutlivesRequest(t *testing.T) {
+	h := newHarness(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if status, err := h.handler.PayVoucher(ctx, "tip", invoice(1, 1000), 1000); err != nil || status != lightning.PaymentSucceeded {
+		t.Fatalf("payout: %v %v", status, err)
+	}
+	if h.node.ctxErrs[0] != nil {
+		t.Fatalf("payment context: %v", h.node.ctxErrs[0])
+	}
+}
+
+func TestRun_ReconcilesPendingPayments(t *testing.T) {
+	h := newHarness(t, nil)
+	h.node.send = func(string) (lightning.Payment, error) { return lightning.Payment{}, errors.New("connection reset") }
+	if status, _ := h.handler.PayVoucher(context.Background(), "tip", invoice(1, 1000), 1000); status != lightning.PaymentPending {
+		t.Fatalf("unknown outcome: %v", status)
+	}
+	h.node.mu.Lock()
+	h.node.lookups[hash(1)] = lightning.Payment{Status: lightning.PaymentFailed}
+	h.node.mu.Unlock()
+	h.handler.reconcile(context.Background())
+	if !h.handler.VoucherFailed("tip", time.Time{}) {
+		t.Fatal("pending payout not reconciled")
+	}
+	if len(h.notifier.events) != 1 || h.notifier.events[0] != (notified{"", lightning.PaymentFailed}) {
+		t.Fatalf("notified %v", h.notifier.events)
 	}
 }

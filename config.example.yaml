@@ -47,8 +47,8 @@ notifications:
   #     events: [invoice.created, payment.received]
   #     secret_file: "/run/secrets/accounting-webhook"
   #   alerts:
-  #     url: "https://alerts.example.com/hooks/vouchers"
-  #     events: [voucher.claimed, voucher.payout_failed, voucher.payout_unknown, payment.sent, payment.failed]
+  #     url: "https://alerts.example.com/hooks/payments"
+  #     events: [payment.sent, payment.failed]
   #     secret_file: "/run/secrets/alerts-webhook"
 
 # Required with withdraw vouchers. Generate the file with: openssl rand -hex 32

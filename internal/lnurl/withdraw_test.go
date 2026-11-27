@@ -28,7 +28,8 @@ import (
 
 type fakeNode struct {
 	mu       sync.Mutex
-	pay      func(ctx context.Context) error
+	pay      func() (lightning.PaymentStatus, error)
+	failedAt map[string]time.Time
 	payments int
 	notified []string
 	invoices map[string]lightning.Invoice
@@ -37,14 +38,31 @@ type fakeNode struct {
 	description, memo string
 }
 
-func (f *fakeNode) SendPayment(ctx context.Context, _ string, _ int64) (lightning.Payment, error) {
+func (f *fakeNode) PayVoucher(_ context.Context, id, _ string, _ int64) (lightning.PaymentStatus, error) {
 	f.mu.Lock()
 	f.payments++
+	pay := f.pay
 	f.mu.Unlock()
-	if f.pay != nil {
-		return lightning.Payment{}, f.pay(ctx)
+	if pay != nil {
+		return pay()
 	}
-	return lightning.Payment{Status: lightning.PaymentSucceeded}, nil
+	return lightning.PaymentSucceeded, nil
+}
+
+func (f *fakeNode) fail(id string, at time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failedAt == nil {
+		f.failedAt = map[string]time.Time{}
+	}
+	f.failedAt[id] = at
+}
+
+func (f *fakeNode) VoucherFailed(id string, since time.Time) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	at, ok := f.failedAt[id]
+	return ok && !at.Before(since)
 }
 
 func (f *fakeNode) AddInvoice(_ context.Context, amountMsat int64, description, memo string) (lightning.Invoice, error) {
@@ -87,12 +105,6 @@ func (f *fakeNode) settle(hash string, preimage []byte) {
 	f.invoices[hash] = invoice
 }
 
-func (f *fakeNode) NotifyVoucher(event, voucherID string, amountMsat int64) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.notified = append(f.notified, fmt.Sprintf("%s %s %d", event, voucherID, amountMsat))
-}
-
 func (f *fakeNode) NotifyInvoiceCreated(amountMsat int64, hash []byte, address, comment string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -103,7 +115,7 @@ var testVoucher = config.Voucher{ID: "tip-001", Token: "abc123", Domain: "exampl
 
 func newWithdraw(t *testing.T, node *fakeNode, statePath string) *WithdrawHandler {
 	t.Helper()
-	h, err := NewWithdrawHandler([]config.Voucher{testVoucher}, []byte("k1 key"), &chaincfg.MainNetParams, node, node, statePath)
+	h, err := NewWithdrawHandler([]config.Voucher{testVoucher}, []byte("k1 key"), &chaincfg.MainNetParams, node, statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +199,7 @@ func claim(t *testing.T, h *WithdrawHandler) map[string]any {
 
 func claimedOnDisk(t *testing.T, statePath string) bool {
 	t.Helper()
-	h, err := NewWithdrawHandler([]config.Voucher{testVoucher}, nil, nil, nil, nil, statePath)
+	h, err := NewWithdrawHandler([]config.Voucher{testVoucher}, nil, nil, nil, statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,9 +228,6 @@ func TestWithdraw_ClaimPaysOnce(t *testing.T) {
 	if node.payments != 1 {
 		t.Fatalf("payments = %d, want 1", node.payments)
 	}
-	if len(node.notified) != 1 || node.notified[0] != "voucher.claimed tip-001 1000000" {
-		t.Fatalf("notified = %v", node.notified)
-	}
 	if !claimedOnDisk(t, statePath) {
 		t.Fatal("claim not persisted")
 	}
@@ -241,63 +250,84 @@ func TestWithdraw_ConcurrentClaimsPayOnce(t *testing.T) {
 }
 
 func TestWithdraw_UnknownOutcomeKeepsClaim(t *testing.T) {
-	node := &fakeNode{pay: func(context.Context) error { return errors.New("recv payment update: stream reset") }}
+	node := &fakeNode{pay: func() (lightning.PaymentStatus, error) { return lightning.PaymentPending, nil }}
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	h := newWithdraw(t, node, statePath)
 
-	wantStatus(t, claim(t, h), "ERROR", "")
+	wantStatus(t, claim(t, h), "ERROR", "payment outcome unknown")
 	wantStatus(t, claim(t, h), "ERROR", "this voucher has already been claimed")
 	if node.payments != 1 {
 		t.Fatalf("payments = %d, want 1", node.payments)
-	}
-	if len(node.notified) != 1 || node.notified[0] != "voucher.payout_unknown tip-001 1000000" {
-		t.Fatalf("notified = %v", node.notified)
 	}
 	if !claimedOnDisk(t, statePath) {
 		t.Fatal("claim with unknown outcome not persisted")
 	}
 }
 
-func TestWithdraw_PaymentOutlivesRequest(t *testing.T) {
-	var payCtxErr error
-	node := &fakeNode{pay: func(ctx context.Context) error {
-		payCtxErr = ctx.Err()
-		return nil
-	}}
-	h := newWithdraw(t, node, filepath.Join(t.TempDir(), "state.json"))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	claimWith(t, ctx, h, first(t, h)["k1"].(string), invoice(t, &chaincfg.MainNetParams, testVoucher.Amount))
-	if node.payments != 1 || payCtxErr != nil {
-		t.Fatalf("payments = %d, payment context error = %v; want 1, nil", node.payments, payCtxErr)
-	}
-}
-
-func TestWithdraw_DefiniteFailureReleases(t *testing.T) {
+func TestWithdraw_LaterFailureReleases(t *testing.T) {
+	node := &fakeNode{pay: func() (lightning.PaymentStatus, error) { return lightning.PaymentPending, nil }}
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	node := &fakeNode{pay: func(context.Context) error {
-		return fmt.Errorf("%w: FAILURE_REASON_NO_ROUTE", lightning.ErrPaymentFailed)
-	}}
 	h := newWithdraw(t, node, statePath)
+	wantStatus(t, claim(t, h), "ERROR", "payment outcome unknown")
 
-	wantStatus(t, claim(t, h), "ERROR", "payment failed")
-	if len(node.notified) != 1 || node.notified[0] != "voucher.payout_failed tip-001 1000000" {
-		t.Fatalf("notified = %v", node.notified)
+	node.fail(testVoucher.ID, time.Now().Add(-time.Hour))
+	wantStatus(t, first(t, h), "ERROR", "this voucher has already been claimed")
+
+	node.fail(testVoucher.ID, time.Now())
+	if resp := first(t, h); resp["tag"] != "withdrawRequest" {
+		t.Fatalf("voucher still claimed after its payout failed: %v", resp)
 	}
 	if claimedOnDisk(t, statePath) {
-		t.Fatal("failed claim still persisted")
+		t.Fatal("release not persisted")
 	}
 	node.pay = nil
 	wantStatus(t, claim(t, h), "OK", "")
 }
 
+func TestWithdraw_FailedAttemptKeepsNewerClaim(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	node := &fakeNode{}
+	h := newWithdraw(t, node, statePath)
+	var newer map[string]any
+	node.pay = func() (lightning.PaymentStatus, error) {
+		node.fail(testVoucher.ID, time.Now())
+		node.pay = nil
+		newer = claim(t, h)
+		return lightning.PaymentFailed, nil
+	}
+	wantStatus(t, claim(t, h), "ERROR", "payment failed")
+	wantStatus(t, newer, "OK", "")
+	if !claimedOnDisk(t, statePath) {
+		t.Fatal("failed attempt released the newer, paid claim")
+	}
+}
+
+func TestWithdraw_DefiniteFailureReleases(t *testing.T) {
+	for name, pay := range map[string]func() (lightning.PaymentStatus, error){
+		"failed":   func() (lightning.PaymentStatus, error) { return lightning.PaymentFailed, nil },
+		"not sent": func() (lightning.PaymentStatus, error) { return "", errors.New("invoice already paid or being paid") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			statePath := filepath.Join(t.TempDir(), "state.json")
+			node := &fakeNode{pay: pay}
+			h := newWithdraw(t, node, statePath)
+
+			wantStatus(t, claim(t, h), "ERROR", "payment failed")
+			if claimedOnDisk(t, statePath) {
+				t.Fatal("failed claim still persisted")
+			}
+			node.pay = nil
+			wantStatus(t, claim(t, h), "OK", "")
+		})
+	}
+}
+
 func TestWithdraw_ClaimPersistedBeforePaying(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	var persisted bool
-	node := &fakeNode{pay: func(context.Context) error {
+	node := &fakeNode{pay: func() (lightning.PaymentStatus, error) {
 		persisted = claimedOnDisk(t, statePath)
-		return nil
+		return lightning.PaymentSucceeded, nil
 	}}
 	wantStatus(t, claim(t, newWithdraw(t, node, statePath)), "OK", "")
 	if !persisted {
@@ -327,7 +357,7 @@ func TestNewWithdrawHandler_CorruptStateFails(t *testing.T) {
 	if err := os.WriteFile(statePath, []byte(`{"claimed":`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewWithdrawHandler([]config.Voucher{testVoucher}, nil, nil, nil, nil, statePath); err == nil {
+	if _, err := NewWithdrawHandler([]config.Voucher{testVoucher}, nil, nil, nil, statePath); err == nil {
 		t.Fatal("expected error for corrupt state")
 	}
 }
@@ -354,15 +384,6 @@ func TestWithdraw_RejectsBadClaims(t *testing.T) {
 		})
 	}
 	wantStatus(t, claimWith(t, context.Background(), h, k1, pr), "OK", "")
-}
-
-func TestWithdraw_WithoutNotifier(t *testing.T) {
-	node := &fakeNode{}
-	h, err := NewWithdrawHandler([]config.Voucher{testVoucher}, []byte("k1 key"), &chaincfg.MainNetParams, node, nil, filepath.Join(t.TempDir(), "state.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantStatus(t, claim(t, h), "OK", "")
 }
 
 func TestValidateBolt11(t *testing.T) {
@@ -410,7 +431,7 @@ func TestWithdraw_MalformedRoutingDoesNotClaim(t *testing.T) {
 func TestOnionWithdrawURLs(t *testing.T) {
 	voucher := testVoucher
 	voucher.Domain = "TEST.onion:80"
-	h, err := NewWithdrawHandler([]config.Voucher{voucher}, nil, nil, nil, nil, filepath.Join(t.TempDir(), "state.json"))
+	h, err := NewWithdrawHandler([]config.Voucher{voucher}, nil, nil, nil, filepath.Join(t.TempDir(), "state.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

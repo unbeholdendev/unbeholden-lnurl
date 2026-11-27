@@ -466,7 +466,7 @@ func TestLoadWebhooks(t *testing.T) {
 	if err := os.WriteFile(path, []byte(fileSecret+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	events := []string{"invoice.created", "payment.received", "voucher.claimed", "voucher.payout_failed", "voucher.payout_unknown"}
+	events := []string{"invoice.created", "payment.received", "payment.sent", "payment.failed"}
 	input := lndYAML + `
 state_dir: /state
 notifications:
@@ -507,6 +507,7 @@ notifications:
 		{"unsafe name", "billing-1:", "../billing:"},
 		{"empty events", "[payment.received]", "[]"},
 		{"unknown event", "[payment.received]", "[payment.refunded]"},
+		{"retired event", "[payment.received]", "[voucher.claimed]"},
 		{"missing state", "state_dir: /state", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

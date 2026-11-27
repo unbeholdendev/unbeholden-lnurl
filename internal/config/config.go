@@ -126,7 +126,7 @@ func (w WebhookConfig) signingKey() ([]byte, error) {
 	}
 	for _, event := range w.Events {
 		switch event {
-		case "invoice.created", "payment.received", "payment.sent", "payment.failed", "voucher.claimed", "voucher.payout_failed", "voucher.payout_unknown":
+		case "invoice.created", "payment.received", "payment.sent", "payment.failed":
 		default:
 			return nil, fmt.Errorf("unknown event %q", event)
 		}

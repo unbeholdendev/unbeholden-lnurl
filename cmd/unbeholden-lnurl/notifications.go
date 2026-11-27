@@ -1,10 +1,10 @@
 package main
 
 import (
-	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
 	"slices"
+	"strconv"
 	"time"
 
 	"unbeholden-lnurl/internal/config"
@@ -41,28 +41,27 @@ func (n *notifications) NotifyInvoiceCreated(amountMsat int64, hash []byte, addr
 	}
 }
 
-func (n *notifications) NotifyVoucher(kind, voucherID string, amountMsat int64) {
-	n.enqueue(webhook.Event{
-		ID: rand.Text(), Type: kind, OccurredAt: time.Now().UTC(),
-		Data: map[string]any{"amount_msat": amountMsat, "voucher_id": voucherID},
-	})
-	if n.ntfy != nil {
-		n.ntfy.NotifyVoucher(kind, voucherID, amountMsat)
-	}
-}
-
 func (n *notifications) NotifyPayment(client string, payment payments.Payment) {
 	kind := "payment.sent"
 	if payment.Status == lightning.PaymentFailed {
 		kind = "payment.failed"
 	}
+	data := map[string]any{
+		"amount_msat": payment.AmountMsat, "fee_msat": payment.FeeMsat,
+		"payment_hash": payment.PaymentHash, "destination": payment.Destination,
+	}
+	if client == "" {
+		data["voucher_id"] = payment.ID
+	} else {
+		data["client"], data["id"] = client, payment.ID
+	}
 	n.enqueue(webhook.Event{
-		ID: kind + "/" + client + "/" + payment.ID, Type: kind, OccurredAt: *payment.CompletedAt,
-		Data: map[string]any{
-			"client": client, "id": payment.ID, "amount_msat": payment.AmountMsat, "fee_msat": payment.FeeMsat,
-			"payment_hash": payment.PaymentHash, "destination": payment.Destination,
-		},
+		ID: kind + "/" + client + "/" + payment.ID + "/" + strconv.FormatInt(payment.CreatedAt.UnixNano(), 10), Type: kind, OccurredAt: *payment.CompletedAt,
+		Data: data,
 	})
+	if n.ntfy != nil && client == "" && payment.Status == lightning.PaymentSucceeded {
+		n.ntfy.NotifyVoucher(payment.ID, payment.AmountMsat)
+	}
 }
 
 func paymentEvent(invoice lightning.Settled) webhook.Event {
